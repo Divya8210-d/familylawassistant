@@ -1,8 +1,11 @@
 """
-Enhanced graph.py with support for:
-1. Post-gathering re-validation
-2. Handling updates/corrections to collected information
-3. Clarification of generated responses
+Updated graph.py with SEPARATE reasoning node.
+
+Key changes:
+1. Generator ONLY generates response
+2. New "analyze_reasoning" node runs AFTER generator
+3. Reasoning can't contaminate response (different nodes)
+4. Clean architecture with clear separation
 """
 
 from langgraph.graph import StateGraph, START, END
@@ -10,9 +13,14 @@ from state import FamilyLawState
 from nodes.query_analyzer import QueryAnalyzer
 from nodes.information_gatherer import InformationGatherer
 from nodes.retriever import retrieve_documents
+
+# Import the CLEAN generator (no reasoning)
 from nodes.generator import generate_response
+
+# Import the NEW reasoning node
+from nodes.reasoning import analyze_reasoning
+
 from node_logger import log_node_execution
-from nodes.update_handler import preprocess_user_message
 from typing import Dict
 import logging
 
@@ -21,21 +29,13 @@ logger = logging.getLogger(__name__)
 
 @log_node_execution("analyze_query")
 def analyze_query_node(state: FamilyLawState) -> FamilyLawState:
-    """
-    Analyze query with support for re-validation.
+    """Analyze query with support for re-validation."""
     
-    Now handles:
-    1. Initial query analysis
-    2. Post-gathering re-validation
-    3. Update/correction scenarios
-    """
-    
-    # Check if this is a re-validation after gathering
     is_revalidation = state.get("revalidation_mode", False)
     
     if is_revalidation:
         logger.info("🔄 RE-VALIDATING after information gathering")
-        state["revalidation_mode"] = False  # Reset flag
+        state["revalidation_mode"] = False
     elif state.get("in_gathering_phase", False):
         logger.info("⏭️  Skipping analysis - already in gathering phase")
         return state
@@ -46,7 +46,6 @@ def analyze_query_node(state: FamilyLawState) -> FamilyLawState:
     try:
         logger.info(f"🔍 === {'RE-' if is_revalidation else ''}ANALYZING QUERY ===")
         
-        # Check if this is an update/correction scenario
         is_update = state.get("is_update", False)
         if is_update:
             logger.info("📝 Processing information update/correction")
@@ -54,14 +53,11 @@ def analyze_query_node(state: FamilyLawState) -> FamilyLawState:
         agent = QueryAnalyzer()
         response = agent.analyze_query(state)
         
-        # Update state
-        
         state["user_intent"] = response.get("user_intent")
         state["info_needed_list"] = response.get("info_needed_list", [])
         state["has_sufficient_info"] = response.get("has_sufficient_info", False)
         state["user_gender"] = response.get("user_gender", state.get("user_gender", None))
-        
-        # Merge new info with existing (for updates)
+
         new_info = response.get("info_collected", {})
         if is_update:
             existing_info = state.get("info_collected", {})
@@ -78,7 +74,6 @@ def analyze_query_node(state: FamilyLawState) -> FamilyLawState:
         logger.info(f"   Info needed: {state['info_needed_list']}")
         logger.info(f"   Sufficient: {state['has_sufficient_info']}")
         
-        # Check intent confidence
         intent_confidence = response.get("intent_confidence", "high")
         if intent_confidence == "low" or not response.get("user_intent"):
             logger.info("❓ Low confidence - requesting clarification")
@@ -97,7 +92,6 @@ def analyze_query_node(state: FamilyLawState) -> FamilyLawState:
                 state["in_gathering_phase"] = True
                 state["gathering_step"] = 0
         
-        # Reset update flag
         state["is_update"] = False
         
         return state
@@ -121,7 +115,6 @@ def gather_information_node(state: FamilyLawState) -> FamilyLawState:
         gatherer = InformationGatherer()
         response = gatherer.gather_next_information(state)
         
-        # Update state
         state["info_collected"] = response.get("info_collected", {})
         state["info_needed_list"] = response.get("info_needed_list", [])
         state["follow_up_question"] = response.get("follow_up_question")
@@ -132,12 +125,11 @@ def gather_information_node(state: FamilyLawState) -> FamilyLawState:
         logger.info(f"   ✓ Collected: {len(state['info_collected'])} items")
         logger.info(f"   ✓ Needed: {len(state['info_needed_list'])} items")
         
-        # Check completion
         if not state["needs_more_info"]:
             logger.info("✅ Gathering complete - triggering re-validation")
             state["has_sufficient_info"] = True
             state["in_gathering_phase"] = False
-            state["revalidation_mode"] = True  # Trigger re-validation
+            state["revalidation_mode"] = True
         
         return state
         
@@ -151,14 +143,10 @@ def gather_information_node(state: FamilyLawState) -> FamilyLawState:
 
 @log_node_execution("revalidate")
 def revalidate_information_node(state: FamilyLawState) -> FamilyLawState:
-    """
-    Re-validate collected information to ensure sufficiency.
-    This runs after gathering is complete.
-    """
+    """Re-validate collected information to ensure sufficiency."""
     logger.info("🔄 === RE-VALIDATING COLLECTED INFORMATION ===")
     
     try:
-        # Create a synthetic query that includes all collected info
         info_collected = state.get("info_collected", {})
 
         if state.get("revalidation_count", 0) >= 2 or len(info_collected) >= 10:
@@ -171,7 +159,6 @@ def revalidate_information_node(state: FamilyLawState) -> FamilyLawState:
         
         original_query = state.get("root_query", "")
         
-        # Format collected info as context
         info_context = "\n".join([
             f"- {key.replace('_', ' ').title()}: {value}"
             for key, value in info_collected.items()
@@ -179,29 +166,24 @@ def revalidate_information_node(state: FamilyLawState) -> FamilyLawState:
         
         synthetic_query = f"{original_query}\n\nMy Information:\n{info_context}"
         
-        # Create temporary state for re-validation
         temp_state = dict(state)
         temp_state["query"] = synthetic_query
         temp_state["analysis_complete"] = False
         temp_state["in_gathering_phase"] = False
         
-        # Run analyzer
         agent = QueryAnalyzer()
         response = agent.analyze_query(temp_state)
         
-        # Check if we still need more info
         additional_info_needed = response.get("info_needed_list", [])
         
         if additional_info_needed:
             logger.info(f"⚠️  Re-validation found {len(additional_info_needed)} missing items")
             logger.info(f"   Additional info needed: {additional_info_needed}")
             
-            # Add to existing needed list (avoid duplicates)
             current_needed = set(state.get("info_needed_list", []))
             current_needed.update(additional_info_needed)
             state["info_needed_list"] = list(current_needed)
             
-            # Resume gathering
             state["in_gathering_phase"] = True
             state["needs_more_info"] = True
             state["has_sufficient_info"] = False
@@ -218,7 +200,6 @@ def revalidate_information_node(state: FamilyLawState) -> FamilyLawState:
     
     except Exception as e:
         logger.error(f"❌ Re-validation failed: {e}", exc_info=True)
-        # On error, proceed anyway
         state["has_sufficient_info"] = True
         return state
 
@@ -233,8 +214,23 @@ def retrieve_documents_node(state: FamilyLawState) -> FamilyLawState:
 
 @log_node_execution("generate")
 def generate_response_node(state: FamilyLawState) -> FamilyLawState:
-    """Generate response with logging."""
+    """
+    Generate ONLY the legal response.
+    Reasoning happens in the next node.
+    """
     result = generate_response(state)
+    state.update(result)
+    return state
+
+
+@log_node_execution("analyze_reasoning")
+def analyze_reasoning_node(state: FamilyLawState) -> FamilyLawState:
+    """
+    NEW NODE: Analyze reasoning AFTER response is generated.
+    
+    This runs separately from generation, so reasoning can't contaminate response.
+    """
+    result = analyze_reasoning(state)
     state.update(result)
     return state
 
@@ -322,9 +318,9 @@ def format_follow_up_response(state: FamilyLawState) -> dict:
 
 
 def create_graph():
-    """Create the enhanced family law assistant graph."""
+    """Create the family law assistant graph with SEPARATE reasoning node."""
     
-    logger.info("🏗️  Building Enhanced LangGraph workflow...")
+    logger.info("🏗️  Building graph with SEPARATE reasoning node...")
     
     workflow = StateGraph(FamilyLawState)
     
@@ -334,13 +330,13 @@ def create_graph():
     workflow.add_node("gather_info", gather_information_node)
     workflow.add_node("ask_question", format_follow_up_response)
     workflow.add_node("revalidate", revalidate_information_node)
-    # workflow.add_node("preprocess", preprocess_user_message)
     workflow.add_node("retrieve", retrieve_documents_node)
     workflow.add_node("generate", generate_response_node)
     
+    # NEW NODE: Reasoning analysis (runs AFTER generate)
+    workflow.add_node("analyze_reasoning", analyze_reasoning_node)
+    
     # Edges
-    # workflow.add_edge(START, "preprocess")
-    # workflow.add_edge("preprocess", "analyze_query")
     workflow.add_edge(START, "analyze_query")
     
     workflow.add_conditional_edges(
@@ -367,7 +363,6 @@ def create_graph():
     
     workflow.add_edge("ask_question", END)
     
-    # Re-validation routing
     workflow.add_conditional_edges(
         "revalidate",
         route_after_revalidation,
@@ -378,10 +373,13 @@ def create_graph():
     )
     
     workflow.add_edge("retrieve", "generate")
-    workflow.add_edge("generate", END)
+    
+    # CRITICAL: Generate → Analyze Reasoning → END
+    workflow.add_edge("generate", "analyze_reasoning")
+    workflow.add_edge("analyze_reasoning", END)
     
     app = workflow.compile()
-    logger.info("✅ Enhanced graph compiled successfully")
+    logger.info("✅ Graph compiled with SEPARATE reasoning node")
     
     return app
 

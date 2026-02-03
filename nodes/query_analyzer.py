@@ -40,7 +40,7 @@ Your task is to:
 
 RESPONSE FORMAT (Strictly JSON only, no other text):
 {{
-  "user_intent": "brief description of what user wants to achieve",
+  "user_intent": "comprehensive description of what user wants to achieve",
   "user_gender": "male|female|other|unknown",
   "intent_confidence": "high|medium|low",
   "info_provided": {{

@@ -1,40 +1,178 @@
 """
-Fixed ReasoningExplainer - Returns data structures only, NO text appending.
+Dynamic Reasoning Explainer - Analyzes actual response generation to provide transparent reasoning.
+
+This module uses LLM analysis to:
+1. Trace which precedents influenced which parts of the response
+2. Explain the reasoning chain that led to the conclusion
+3. Score precedent relevance based on actual usage in response
+4. Provide transparency for user trust
 """
 
-from typing import List, Dict
+from typing import List, Dict, Optional, Tuple
 import json
 import logging
+import re
 from pydantic import BaseModel
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+import os
 
 logger = logging.getLogger(__name__)
 
 
 class ReasoningStep(BaseModel):
+    """Single step in the reasoning chain."""
     step_number: int
-    step_type: str  # "analysis", "legal_rule", "precedent", "conclusion"
+    step_type: str  # "situation_analysis", "legal_framework", "precedent_application", "conclusion"
     title: str
     explanation: str
-    confidence: float
-    supporting_sources: List[str]
-    legal_provisions: List[str]
+    confidence: float  # 0.0 to 1.0
+    supporting_sources: List[str]  # Which precedent chunks were used
+    legal_provisions: List[str]  # Specific laws/sections mentioned
+    response_excerpt: str  # Which part of the response this step produced
 
 
-class PrecedentExplanation(BaseModel):
+class PrecedentUsage(BaseModel):
+    """Detailed analysis of how a precedent was used."""
     precedent_title: str
-    similarity_score: float
+    precedent_index: int  # Index in retrieved_chunks
+    retrieval_score: float  # Original similarity score
+    usage_score: float  # How much it was actually used (0.0 to 1.0)
     matching_factors: List[str]
     different_factors: List[str]
-    key_excerpt: str
-    relevance_explanation: str
+    key_excerpt: str  # From the precedent
+    how_it_influenced_response: str  # Specific explanation
+    response_sections_influenced: List[str]  # Which parts of response
     citation: str
 
 
-class ReasoningExplainer:
+class DynamicReasoningExplainer:
     """
-    Generates structured explanations of legal reasoning.
-    RETURNS DATA STRUCTURES ONLY - DOES NOT MODIFY TEXT.
+    Analyzes the generated response to provide transparent reasoning.
+    
+    Unlike static reasoning, this actually traces:
+    - Which precedents influenced which parts of the response
+    - Why certain legal provisions were chosen
+    - How the conclusion was reached step by step
     """
+    
+    # Prompt for analyzing reasoning chain
+    REASONING_ANALYSIS_PROMPT = """You are a legal reasoning analyst. Your task is to reverse-engineer the legal reasoning that led to a specific response.
+
+CASE INFORMATION:
+{case_info}
+
+RETRIEVED PRECEDENTS:
+{precedents_summary}
+
+GENERATED LEGAL ADVICE:
+{response}
+
+YOUR TASK:
+Analyze the reasoning chain that led to this response. Identify 4 key steps:
+
+1. **SITUATION ANALYSIS**: What key facts were identified and why they matter
+2. **LEGAL FRAMEWORK**: Which laws/provisions apply and why
+3. **PRECEDENT APPLICATION**: How precedents informed the advice
+4. **CONCLUSION**: Final recommendations and reasoning
+
+For each step, provide:
+- A clear title
+- Detailed explanation
+- Confidence level (0.0-1.0)
+- Which precedents/sources were used (reference by [Precedent N])
+- Which legal provisions were cited
+- A brief excerpt from the response that this step produced
+
+OUTPUT FORMAT (JSON):
+{{
+  "reasoning_steps": [
+    {{
+      "step_number": 1,
+      "step_type": "situation_analysis",
+      "title": "Brief title",
+      "explanation": "Detailed explanation of this reasoning step",
+      "confidence": 0.95,
+      "supporting_sources": ["Precedent 1", "Precedent 2"],
+      "legal_provisions": ["IPC s.498A", "HMA 1955 s.13"],
+      "response_excerpt": "The relevant part of the response this produced"
+    }},
+    ...
+  ]
+}}
+
+CRITICAL RULES:
+- Reference precedents using [Precedent N] format
+- Extract actual legal provisions from the response
+- Be specific about which part of response each step produced
+- Confidence should reflect certainty of reasoning
+- Focus on ACTUAL reasoning, not hypothetical
+
+YOUR ANALYSIS (JSON only):"""
+
+    # Prompt for analyzing precedent usage
+    PRECEDENT_USAGE_PROMPT = """Analyze how a specific precedent influenced the legal response.
+
+PRECEDENT INFORMATION:
+Title: {precedent_title}
+Retrieval Score: {retrieval_score:.0%}
+Content: {precedent_content}
+
+CASE SUMMARY:
+{case_summary}
+
+GENERATED RESPONSE:
+{response}
+
+YOUR TASK:
+Analyze HOW MUCH and HOW this precedent actually influenced the response.
+
+Provide:
+1. **Usage Score** (0.0-1.0): How heavily was this precedent used?
+   - 1.0 = Core precedent, directly shaped response
+   - 0.5-0.9 = Important supporting precedent
+   - 0.1-0.4 = Minor reference or background
+   - 0.0 = Retrieved but not used
+
+2. **Matching Factors**: What similarities between precedent and case made it relevant?
+
+3. **Different Factors**: What differences exist (if any)?
+
+4. **Influence Explanation**: HOW did this precedent shape the response?
+
+5. **Response Sections**: Which specific parts of the response were influenced?
+
+OUTPUT FORMAT (JSON):
+{{
+  "usage_score": calculated score between 0.0 and 1.0,
+  "matching_factors": ["Both cases involve...", "Similar factual pattern of..."],
+  "different_factors": ["Different on procedural aspect", "Time period differs"],
+  "key_excerpt": "Most relevant quote from the precedent",
+  "how_it_influenced_response": "This precedent directly informed the advice on X because...",
+  "response_sections_influenced": ["The section on grounds for divorce", "Recommendation to file under Section 13"]
+}}
+
+CRITICAL RULES:
+- Usage score must reflect ACTUAL usage, not just similarity
+- Be specific about which response sections were influenced
+- If precedent wasn't used, usage_score should be low (< 0.3)
+- Matching factors should be case-specific, not generic
+
+YOUR ANALYSIS (JSON only):"""
+
+    def __init__(self, huggingface_api_key: str = None):
+        """Initialize with LLM for analysis."""
+        api_key = huggingface_api_key or os.getenv("HUGGINGFACE_API_KEY")
+        
+        self.llm = ChatHuggingFace(
+            llm=HuggingFaceEndpoint(
+                repo_id=os.getenv("LLM_MODEL", "meta-llama/Llama-3.1-8B-Instruct"),
+                huggingfacehub_api_token=api_key,
+                task="text-generation",
+                max_new_tokens=2048,
+                temperature=0.3,  # Lower temp for more analytical reasoning
+            )
+        )
     
     def generate_reasoning_chain(
         self,
@@ -44,259 +182,298 @@ class ReasoningExplainer:
         retrieved_chunks: List[Dict]
     ) -> List[ReasoningStep]:
         """
-        Generate reasoning steps explaining how the conclusion was reached.
-        RETURNS: List of ReasoningStep objects
-        DOES NOT: Modify the response text
+        Generate dynamic reasoning chain by analyzing the actual response.
+        
+        This traces backwards from the response to understand the reasoning.
         """
-        reasoning_steps = []
+        logger.info("🧠 === GENERATING DYNAMIC REASONING CHAIN ===")
         
         try:
-            # Step 1: Situation Analysis
-            reasoning_steps.append(ReasoningStep(
-                step_number=1,
-                step_type="analysis",
-                title="Situation Analysis",
-                explanation=self._generate_situation_analysis(info_collected, user_intent),
-                confidence=0.95,
-                supporting_sources=["User Input"],
-                legal_provisions=[]
-            ))
+            # Format inputs
+            case_info = self._format_case_info(info_collected, user_intent)
+            precedents_summary = self._format_precedents_for_analysis(retrieved_chunks)
             
-            # Step 2: Legal Rules
-            legal_provisions = self._extract_legal_provisions(response)
-            reasoning_steps.append(ReasoningStep(
-                step_number=2,
-                step_type="legal_rule",
-                title="Applicable Laws",
-                explanation=self._generate_legal_explanation(legal_provisions, user_intent),
-                confidence=1.0,
-                supporting_sources=["Indian Legal Code"],
-                legal_provisions=legal_provisions
-            ))
+            # Build prompt
+            prompt = self.REASONING_ANALYSIS_PROMPT.format(
+                case_info=case_info,
+                precedents_summary=precedents_summary,
+                response=response
+            )
             
-            # Step 3: Precedent Analysis
-            if retrieved_chunks:
-                reasoning_steps.append(ReasoningStep(
-                    step_number=3,
-                    step_type="precedent",
-                    title="Relevant Precedents",
-                    explanation=f"Analyzed {len(retrieved_chunks)} relevant precedents to understand similar cases and their outcomes.",
-                    confidence=0.80,
-                    supporting_sources=[f"Precedent {i+1}" for i in range(min(3, len(retrieved_chunks)))],
-                    legal_provisions=[]
-                ))
+            # Get analysis
+            conversation = [
+                SystemMessage(content="You are a legal reasoning analyst. Provide detailed JSON analysis."),
+                HumanMessage(content=prompt)
+            ]
             
-            # Step 4: Conclusion
-            reasoning_steps.append(ReasoningStep(
-                step_number=4,
-                step_type="conclusion",
-                title="Recommended Course of Action",
-                explanation=self._generate_conclusion(user_intent, legal_provisions),
-                confidence=0.90,
-                supporting_sources=["Legal Analysis"],
-                legal_provisions=legal_provisions
-            ))
+            llm_response = self.llm.invoke(conversation)
+            response_text = llm_response.content.strip()
             
-            logger.info(f"✓ Generated {len(reasoning_steps)} reasoning steps (structured data only)")
+            # Parse JSON
+            reasoning_data = self._extract_json(response_text)
+            
+            # Convert to ReasoningStep objects
+            reasoning_steps = []
+            for step_data in reasoning_data.get("reasoning_steps", []):
+                step = ReasoningStep(
+                    step_number=step_data.get("step_number", 0),
+                    step_type=step_data.get("step_type", "analysis"),
+                    title=step_data.get("title", ""),
+                    explanation=step_data.get("explanation", ""),
+                    confidence=float(step_data.get("confidence", 0.8)),
+                    supporting_sources=step_data.get("supporting_sources", []),
+                    legal_provisions=step_data.get("legal_provisions", []),
+                    response_excerpt=step_data.get("response_excerpt", "")
+                )
+                reasoning_steps.append(step)
+            
+            logger.info(f"   ✓ Generated {len(reasoning_steps)} dynamic reasoning steps")
+            
             return reasoning_steps
             
         except Exception as e:
-            logger.error(f"Error generating reasoning: {e}")
-            return []
+            logger.error(f"❌ Failed to generate reasoning chain: {e}", exc_info=True)
+            return self._fallback_reasoning(response, retrieved_chunks)
+    
+    def analyze_precedent_usage(
+        self,
+        precedent: Dict,
+        precedent_index: int,
+        case_summary: str,
+        response: str
+    ) -> PrecedentUsage:
+        """
+        Analyze how a specific precedent influenced the response.
+        
+        This provides transparency on precedent relevance.
+        """
+        try:
+            metadata = precedent.get('metadata', {})
+            content = precedent.get('content', '')
+            retrieval_score = precedent.get('score', 0.0)
+            
+            # Build prompt
+            prompt = self.PRECEDENT_USAGE_PROMPT.format(
+                precedent_title=metadata.get('title', f'Precedent {precedent_index + 1}'),
+                retrieval_score=retrieval_score,
+                precedent_content=content[:1000],  # Limit length
+                case_summary=case_summary,
+                response=response
+            )
+            
+            # Get analysis
+            conversation = [
+                SystemMessage(content="You are analyzing precedent usage. Provide JSON analysis."),
+                HumanMessage(content=prompt)
+            ]
+            
+            llm_response = self.llm.invoke(conversation)
+            response_text = llm_response.content.strip()
+            
+            # Parse JSON
+            usage_data = self._extract_json(response_text)
+            
+            # Create PrecedentUsage object
+            usage = PrecedentUsage(
+                precedent_title=metadata.get('title', f'Precedent {precedent_index + 1}'),
+                precedent_index=precedent_index,
+                retrieval_score=retrieval_score,
+                usage_score=float(usage_data.get('usage_score', 0.5)),
+                matching_factors=usage_data.get('matching_factors', []),
+                different_factors=usage_data.get('different_factors', []),
+                key_excerpt=usage_data.get('key_excerpt', content[:200]),
+                how_it_influenced_response=usage_data.get('how_it_influenced_response', ''),
+                response_sections_influenced=usage_data.get('response_sections_influenced', []),
+                citation=metadata.get('url', metadata.get('source', ''))
+            )
+            
+            return usage
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to analyze precedent {precedent_index}: {e}")
+            return self._fallback_precedent_usage(precedent, precedent_index)
     
     def generate_all_precedent_explanations(
         self,
         case_summary: str,
-        retrieved_chunks: List[Dict]
-    ) -> List[PrecedentExplanation]:
+        retrieved_chunks: List[Dict],
+        response: str
+    ) -> List[PrecedentUsage]:
         """
-        Generate explanations for all retrieved precedents.
-        RETURNS: List of PrecedentExplanation objects
-        DOES NOT: Modify any text
+        Analyze all precedents to show which were actually used.
+        
+        Provides full transparency on precedent relevance.
         """
+        logger.info("📊 === ANALYZING PRECEDENT USAGE ===")
+        
         explanations = []
         
-        try:
-            for i, chunk in enumerate(retrieved_chunks[:5]):  # Top 5 precedents
-                explanation = self._analyze_precedent(case_summary, chunk, i)
-                if explanation:
-                    explanations.append(explanation)
-            
-            logger.info(f"✓ Generated {len(explanations)} precedent explanations (structured data only)")
-            return explanations
-            
-        except Exception as e:
-            logger.error(f"Error generating precedent explanations: {e}")
-            return []
+        # Analyze top 5 precedents
+        for i, chunk in enumerate(retrieved_chunks[:5]):
+            try:
+                usage = self.analyze_precedent_usage(
+                    precedent=chunk,
+                    precedent_index=i,
+                    case_summary=case_summary,
+                    response=response
+                )
+                explanations.append(usage)
+                
+                logger.info(f"   Precedent {i+1}: "
+                          f"retrieval={usage.retrieval_score:.0%}, "
+                          f"usage={usage.usage_score:.0%}")
+                
+            except Exception as e:
+                logger.error(f"Failed to analyze precedent {i}: {e}")
+                continue
+        
+        # Sort by usage score (most used first)
+        explanations.sort(key=lambda x: x.usage_score, reverse=True)
+        
+        logger.info(f"   ✓ Analyzed {len(explanations)} precedents")
+        
+        return explanations
     
-    def _generate_situation_analysis(self, info_collected: Dict, user_intent: str) -> str:
-        """Generate situation analysis text."""
-        key_facts = []
+    def _format_case_info(self, info_collected: Dict, user_intent: str) -> str:
+        """Format case information for analysis."""
+        lines = [f"User Intent: {user_intent}", ""]
         
-        if "marriage_duration" in info_collected:
-            key_facts.append(f"marriage of {info_collected['marriage_duration']}")
-        
-        if "separation_duration" in info_collected:
-            key_facts.append(f"separated for {info_collected['separation_duration']}")
-        
-        if "emotional_abuse" in str(info_collected.get("abuse", "")).lower():
-            key_facts.append("allegations of emotional abuse")
-        
-        if "child_age" in info_collected:
-            key_facts.append(f"minor child aged {info_collected['child_age']}")
-        
-        if key_facts:
-            return f"Identified key case factors: {', '.join(key_facts)}. The case involves {user_intent.lower()}."
+        if info_collected:
+            lines.append("Collected Information:")
+            for key, value in info_collected.items():
+                if key != "additional_info":
+                    lines.append(f"  - {key.replace('_', ' ').title()}: {value}")
         else:
-            return f"Analyzed the case involving {user_intent.lower()}."
+            lines.append("Limited case information available.")
+        
+        return "\n".join(lines)
     
-    def _extract_legal_provisions(self, response: str) -> List[str]:
-        """Extract legal provisions mentioned in response."""
+    def _format_precedents_for_analysis(self, retrieved_chunks: List[Dict]) -> str:
+        """Format precedents for reasoning analysis."""
+        if not retrieved_chunks:
+            return "No precedents retrieved."
+        
+        lines = []
+        for i, chunk in enumerate(retrieved_chunks[:5], 1):
+            metadata = chunk.get('metadata', {})
+            lines.append(f"\n[Precedent {i}] ({chunk.get('score', 0):.0%} similarity)")
+            lines.append(f"Title: {metadata.get('title', 'Unknown')}")
+            lines.append(f"Content: {chunk.get('content', '')[:300]}...")
+        
+        return "\n".join(lines)
+    
+    def _extract_json(self, text: str) -> Dict:
+        """Extract JSON from LLM response."""
+        # Remove markdown code blocks
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0].strip()
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0].strip()
+        
+        # Parse JSON
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parse error: {e}")
+            # Try to find JSON object in text
+            match = re.search(r'\{.*\}', text, re.DOTALL)
+            if match:
+                return json.loads(match.group())
+            raise
+    
+    def _fallback_reasoning(self, response: str, retrieved_chunks: List[Dict]) -> List[ReasoningStep]:
+        """Fallback reasoning if LLM analysis fails."""
+        logger.warning("Using fallback reasoning generation")
+        
+        return [
+            ReasoningStep(
+                step_number=1,
+                step_type="situation_analysis",
+                title="Case Analysis",
+                explanation="Analyzed the client's situation based on provided information.",
+                confidence=0.7,
+                supporting_sources=["User Input"],
+                legal_provisions=[],
+                response_excerpt=response[:200] if response else ""
+            ),
+            ReasoningStep(
+                step_number=2,
+                step_type="legal_framework",
+                title="Legal Framework",
+                explanation="Identified applicable Indian family law provisions.",
+                confidence=0.8,
+                supporting_sources=["Indian Legal Code"],
+                legal_provisions=self._extract_legal_refs(response),
+                response_excerpt=response[200:400] if len(response) > 200 else ""
+            ),
+            ReasoningStep(
+                step_number=3,
+                step_type="precedent_application",
+                title="Precedent Analysis",
+                explanation=f"Reviewed {len(retrieved_chunks)} relevant precedents.",
+                confidence=0.75,
+                supporting_sources=[f"Precedent {i+1}" for i in range(min(3, len(retrieved_chunks)))],
+                legal_provisions=[],
+                response_excerpt=""
+            ),
+            ReasoningStep(
+                step_number=4,
+                step_type="conclusion",
+                title="Recommendations",
+                explanation="Provided actionable legal recommendations based on analysis.",
+                confidence=0.85,
+                supporting_sources=["Legal Analysis"],
+                legal_provisions=[],
+                response_excerpt=response[-200:] if len(response) > 200 else response
+            )
+        ]
+    
+    def _fallback_precedent_usage(self, precedent: Dict, index: int) -> PrecedentUsage:
+        """Fallback precedent analysis if LLM fails."""
+        metadata = precedent.get('metadata', {})
+        
+        return PrecedentUsage(
+            precedent_title=metadata.get('title', f'Precedent {index + 1}'),
+            precedent_index=index,
+            retrieval_score=precedent.get('score', 0.0),
+            usage_score=0.5,  # Neutral score
+            matching_factors=["Similar family law context"],
+            different_factors=["Specific circumstances may vary"],
+            key_excerpt=precedent.get('content', '')[:200],
+            how_it_influenced_response="Analysis unavailable",
+            response_sections_influenced=[],
+            citation=metadata.get('url', '')
+        )
+    
+    def _extract_legal_refs(self, text: str) -> List[str]:
+        """Extract legal provision references from text."""
         provisions = []
         
         # Common patterns
-        if "Section 13" in response or "s.13" in response or "s. 13" in response:
-            provisions.append("Hindu Marriage Act, 1955 - Section 13")
+        patterns = [
+            r'Section \d+[A-Z]?',
+            r's\.\s?\d+[A-Z]?',
+            r'IPC.*?Section \d+',
+            r'Hindu Marriage Act.*?Section \d+',
+            r'CrPC.*?Section \d+'
+        ]
         
-        if "Section 125" in response or "s.125" in response or "s. 125" in response:
-            provisions.append("Code of Criminal Procedure - Section 125")
+        for pattern in patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            provisions.extend(matches)
         
-        if "498A" in response or "Section 498A" in response:
-            provisions.append("Indian Penal Code - Section 498A")
-        
-        if "Domestic Violence Act" in response or "PWDVA" in response:
-            provisions.append("Protection of Women from Domestic Violence Act, 2005")
-        
-        if "Guardians and Wards Act" in response:
-            provisions.append("Guardians and Wards Act, 1890")
-        
-        return provisions if provisions else ["Indian Family Law"]
-    
-    def _generate_legal_explanation(self, provisions: List[str], user_intent: str) -> str:
-        """Generate explanation of applicable laws."""
-        if not provisions:
-            return f"Applied general principles of Indian family law relevant to {user_intent.lower()}."
-        
-        return f"The following laws are applicable: {', '.join(provisions)}. These statutes govern {user_intent.lower()} and related matters."
-    
-    def _generate_conclusion(self, user_intent: str, provisions: List[str]) -> str:
-        """Generate conclusion explanation."""
-        return (f"Based on the case analysis and applicable laws ({', '.join(provisions[:2])}), "
-                f"recommended specific legal remedies and practical steps for {user_intent.lower()}.")
-    
-    def _analyze_precedent(
-        self,
-        case_summary: str,
-        chunk: Dict,
-        index: int
-    ) -> PrecedentExplanation:
-        """Analyze a single precedent."""
-        try:
-            metadata = chunk.get('metadata', {})
-            content = chunk.get('content', '')
-            score = chunk.get('score', 0.0)
-            
-            # Extract key information
-            title = metadata.get('title', f'Precedent {index + 1}')
-            
-            # Simple matching analysis
-            matching_factors = self._find_matching_factors(case_summary, content)
-            different_factors = self._find_different_factors(case_summary, content)
-            
-            # Extract key excerpt (first meaningful sentence)
-            key_excerpt = self._extract_key_excerpt(content)
-            
-            # Generate relevance explanation
-            relevance = self._generate_relevance_explanation(matching_factors, score)
-            
-            # Get citation URL
-            citation = metadata.get('url', metadata.get('source', ''))
-            
-            return PrecedentExplanation(
-                precedent_title=title,
-                similarity_score=score,
-                matching_factors=matching_factors,
-                different_factors=different_factors,
-                key_excerpt=key_excerpt,
-                relevance_explanation=relevance,
-                citation=citation
-            )
-            
-        except Exception as e:
-            logger.error(f"Error analyzing precedent {index}: {e}")
-            return None
-    
-    def _find_matching_factors(self, case_summary: str, content: str) -> List[str]:
-        """Find factors that match between case and precedent."""
-        factors = []
-        
-        if "divorce" in case_summary.lower() and "divorce" in content.lower():
-            factors.append("Both cases involve divorce proceedings")
-        
-        if "custody" in case_summary.lower() and "custody" in content.lower():
-            factors.append("Both cases address child custody issues")
-        
-        if "maintenance" in case_summary.lower() and "maintenance" in content.lower():
-            factors.append("Both cases involve maintenance claims")
-        
-        if "abuse" in case_summary.lower() and "abuse" in content.lower():
-            factors.append("Both cases involve allegations of abuse")
-        
-        if not factors:
-            factors.append("Similar family law context")
-        
-        return factors
-    
-    def _find_different_factors(self, case_summary: str, content: str) -> List[str]:
-        """Find factors that differ between case and precedent."""
-        factors = []
-        
-        # Note: This is a simplified version
-        if "male" in case_summary.lower() and "wife" in content.lower():
-            factors.append("Different party perspectives (husband vs wife)")
-        
-        if len(factors) < 1:
-            factors.append("Different specific circumstances and case details")
-        
-        return factors
-    
-    def _extract_key_excerpt(self, content: str) -> str:
-        """Extract a key excerpt from the precedent."""
-        # Get first meaningful sentence (simplified)
-        sentences = content.split('.')
-        for sentence in sentences[:3]:
-            if len(sentence.strip()) > 50:
-                excerpt = sentence.strip()
-                if len(excerpt) > 200:
-                    excerpt = excerpt[:197] + "..."
-                return excerpt
-        
-        return content[:200] + "..." if len(content) > 200 else content
-    
-    def _generate_relevance_explanation(self, matching_factors: List[str], score: float) -> str:
-        """Generate explanation of why precedent is relevant."""
-        if score >= 0.80:
-            strength = "highly"
-        elif score >= 0.70:
-            strength = "significantly"
-        else:
-            strength = "moderately"
-        
-        return (f"This precedent is {strength} relevant because: {', '.join(matching_factors[:2])}. "
-                f"It provides guidance on similar legal issues and can inform the approach to your case.")
+        return list(set(provisions))[:5]  # Deduplicate and limit
 
 
 def create_case_summary(info_collected: Dict, user_intent: str) -> str:
-    """Create a brief case summary for precedent analysis."""
+    """Create brief case summary for precedent analysis."""
     parts = [user_intent]
     
     if "user_gender" in info_collected:
         parts.append(f"({info_collected['user_gender']} seeking advice)")
     
-    if "marriage_duration" in info_collected:
-        parts.append(f"married for {info_collected['marriage_duration']}")
+    for key in ["marriage_duration", "separation_duration", "child_age", "abuse_type"]:
+        if key in info_collected:
+            parts.append(f"{key.replace('_', ' ')}: {info_collected[key]}")
     
-    if "child_age" in info_collected:
-        parts.append(f"child aged {info_collected['child_age']}")
-    
-    return " - ".join(parts)
+    return " | ".join(parts)

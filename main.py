@@ -57,6 +57,11 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
+TRACE_DIR = "event_traces"
+os.makedirs(TRACE_DIR, exist_ok=True)
+
+
+
 # Initialize settings
 settings = get_settings()
 
@@ -465,7 +470,7 @@ def save_history(conversation_id: str, messages: List, state: dict) -> bool:
             "messages": serializable_messages,
             "state": {
                 "root_query": state.get("root_query", ""),
-                "user_gender": state.get("user_gender", None),
+                "user_gender": state.get("user_gender", "unknown"),
                 "user_intent": state.get("user_intent"),
                 "in_gathering_phase": state.get("in_gathering_phase", False),
                 "info_collected": state.get("info_collected", {}),
@@ -496,6 +501,8 @@ def save_history(conversation_id: str, messages: List, state: dict) -> bool:
         return False
 
 
+
+
 @app.post("/chat/stream")
 @limiter.limit(f"{settings.rate_limit_per_minute}/minute")
 async def chat_stream(request: Request, query_request: QueryRequest):
@@ -509,6 +516,27 @@ async def chat_stream(request: Request, query_request: QueryRequest):
             logger.info(f"NEW REQUEST: {conversation_id}")
             logger.info(f"Query: {query_request.query}")
             logger.info("="*80)
+
+            trace_file_path = os.path.join(
+                TRACE_DIR,
+                f"{conversation_id}.log"
+            )
+
+            trace_file = open(trace_file_path, "a", encoding="utf-8")
+
+            def write_trace(event_type, payload):
+                trace_file.write(
+                    json.dumps(
+                        {
+                            "ts": datetime.utcnow().isoformat(),
+                            "type": event_type,
+                            "payload": payload
+                        },
+                        default=str
+                    ) + "\n"
+                )
+                trace_file.flush()   # IMPORTANT: don’t lose data on crash
+
             
             # Load history
             messages, previous_state = load_history(conversation_id)
@@ -525,7 +553,7 @@ async def chat_stream(request: Request, query_request: QueryRequest):
                 "conversation_id": conversation_id,
                 
                 # Restore previous state
-                "user_gender": previous_state.get("user_gender", None),
+                "user_gender": previous_state.get("user_gender", "unknown"),
                 "root_query": previous_state.get("root_query", ""),
                 "user_intent": previous_state.get("user_intent", ""),
                 "analysis_complete": previous_state.get("analysis_complete", False),
@@ -569,6 +597,7 @@ async def chat_stream(request: Request, query_request: QueryRequest):
             
             # Stream events
             async for event in family_law_app.astream_events(state, version="v2"):
+                write_trace("langgraph_event", event)
                 kind = event["event"]
                 
                 # Clarification
@@ -608,8 +637,10 @@ async def chat_stream(request: Request, query_request: QueryRequest):
                     yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
                 
                 # LLM streaming
-                if kind == "on_chat_model_stream":
+
+                if kind == "on_chat_model_stream" and (event["metadata"]["langgraph_node"] == "gather_info" or event["metadata"]["langgraph_node"] == "generate"):
                     content = event["data"]["chunk"].content
+                    
                     if content:
                         message_type = "final_response"
                         accumulated_response += content
