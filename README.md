@@ -93,3 +93,4 @@ cd family-law-assistant/frontend
 npm run dev
 ```
 
+<img alt="workflow" src="image.png" />
