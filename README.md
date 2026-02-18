@@ -53,7 +53,12 @@ source .venv/bin/activate
 source .venv\bin\activate
 ```
 
-Copy the `.env` file shared in the WhatsApp group and paste it into the root of the project directory.
+Configure Environment Variables:
+Create a .env file in the root directory using the provided template:
+
+```bash
+cp env.template .env
+```
 
 ---
 
@@ -87,3 +92,4 @@ In a new terminal:
 cd family-law-assistant/frontend
 npm run dev
 ```
+
