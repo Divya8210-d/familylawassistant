@@ -62,6 +62,7 @@ class User(Base):
     email           = Column(String(255), unique=True, nullable=False, index=True)
     full_name       = Column(String(255), nullable=False)
     hashed_password = Column(String(255), nullable=False)
+    gender          = Column(String(20), nullable=True)   # male | female | other
     created_at      = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
@@ -131,6 +132,12 @@ async def create_tables():
     """Create all application-level tables (idempotent)."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Lightweight migration: add columns that may be missing on older schemas
+        await conn.execute(
+            __import__("sqlalchemy").text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS gender VARCHAR(20)"
+            )
+        )
 
 
 async def get_db() -> AsyncSession:

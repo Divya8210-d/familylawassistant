@@ -146,6 +146,7 @@ class SignUpRequest(BaseModel):
     email:     str = Field(..., min_length=3, max_length=255)
     password:  str = Field(..., min_length=6, max_length=128)
     full_name: str = Field(..., min_length=1, max_length=255)
+    gender:    Optional[str] = Field(None, description="male | female | other")
 
 
 class SignInRequest(BaseModel):
@@ -262,6 +263,7 @@ async def signup(body: SignUpRequest, db: AsyncSession = Depends(get_db)):
         email=body.email,
         full_name=body.full_name,
         hashed_password=hash_password(body.password),
+        gender=body.gender,
     )
     db.add(user)
     await db.commit()
@@ -271,7 +273,7 @@ async def signup(body: SignUpRequest, db: AsyncSession = Depends(get_db)):
     logger.info(f"✅ New user registered: {user.email} (id={user.id})")
     return AuthResponse(
         access_token=token,
-        user={"id": user.id, "email": user.email, "full_name": user.full_name},
+        user={"id": user.id, "email": user.email, "full_name": user.full_name, "gender": user.gender},
     )
 
 
@@ -286,14 +288,14 @@ async def signin(body: SignInRequest, db: AsyncSession = Depends(get_db)):
     logger.info(f"✅ User signed in: {user.email}")
     return AuthResponse(
         access_token=token,
-        user={"id": user.id, "email": user.email, "full_name": user.full_name},
+        user={"id": user.id, "email": user.email, "full_name": user.full_name, "gender": user.gender},
     )
 
 
 @app.get("/auth/me")
 async def auth_me(current_user: User = Depends(get_current_user)):
     """Return the currently authenticated user's info."""
-    return {"id": current_user.id, "email": current_user.email, "full_name": current_user.full_name}
+    return {"id": current_user.id, "email": current_user.email, "full_name": current_user.full_name, "gender": current_user.gender}
 
 
 # ── Chat streaming endpoint ───────────────────────────────────────────────────
@@ -355,6 +357,7 @@ async def chat_stream(
             initial_state = {
                 "query":              chat_request.query,
                 "messages":           [HumanMessage(content=chat_request.query)],
+                "user_gender":        current_user.gender or "unknown",
                 "include_reasoning":  chat_request.include_reasoning,
                 "include_prediction": chat_request.include_prediction,
                 # Resettable per-turn fields
