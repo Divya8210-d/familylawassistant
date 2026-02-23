@@ -45,6 +45,9 @@ dependencies = [
     "asyncpg>=0.31.0",
     "psycopg[binary,pool]>=3.3.3",
     "langgraph-checkpoint-postgres>=3.0.4",
+    # Auth
+    "passlib[bcrypt]>=1.7.4",
+    "python-jose[cryptography]>=3.3.0",
 ]
 
 [project.optional-dependencies]

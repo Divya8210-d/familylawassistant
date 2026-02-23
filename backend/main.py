@@ -65,8 +65,9 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from config import get_settings
-from database import AsyncSessionLocal, Thread, Message, create_tables, get_db
+from database import AsyncSessionLocal, Thread, Message, User, create_tables, get_db
 from graph import create_graph
+from auth import hash_password, verify_password, create_access_token, get_current_user
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 settings = get_settings()
@@ -141,10 +142,26 @@ logger.info(f"CORS origins: {settings.cors_origins}")
 
 # ── Request / Response models ─────────────────────────────────────────────────
 
+class SignUpRequest(BaseModel):
+    email:     str = Field(..., min_length=3, max_length=255)
+    password:  str = Field(..., min_length=6, max_length=128)
+    full_name: str = Field(..., min_length=1, max_length=255)
+
+
+class SignInRequest(BaseModel):
+    email:    str = Field(...)
+    password: str = Field(...)
+
+
+class AuthResponse(BaseModel):
+    access_token: str
+    token_type:   str = "bearer"
+    user:         dict
+
+
 class ChatRequest(BaseModel):
     query:             str           = Field(..., min_length=1, max_length=2000)
     thread_id:         Optional[str] = Field(None, description="UUID; omit to start a new conversation")
-    user_id:           int           = Field(..., description="FK → users.user_id")
     include_reasoning: bool          = Field(default=True)
     include_prediction: bool         = Field(default=True)
 
@@ -232,6 +249,53 @@ async def _save_interaction(
             logger.error(f"❌ [bg] Failed to save interaction: {e}", exc_info=True)
 
 
+# ── Auth endpoints ────────────────────────────────────────────────────────────
+
+@app.post("/auth/signup", response_model=AuthResponse)
+async def signup(body: SignUpRequest, db: AsyncSession = Depends(get_db)):
+    # Check if email already exists
+    result = await db.execute(select(User).where(User.email == body.email))
+    if result.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    user = User(
+        email=body.email,
+        full_name=body.full_name,
+        hashed_password=hash_password(body.password),
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+
+    token = create_access_token({"user_id": user.id, "email": user.email})
+    logger.info(f"✅ New user registered: {user.email} (id={user.id})")
+    return AuthResponse(
+        access_token=token,
+        user={"id": user.id, "email": user.email, "full_name": user.full_name},
+    )
+
+
+@app.post("/auth/signin", response_model=AuthResponse)
+async def signin(body: SignInRequest, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).where(User.email == body.email))
+    user = result.scalar_one_or_none()
+    if not user or not verify_password(body.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    token = create_access_token({"user_id": user.id, "email": user.email})
+    logger.info(f"✅ User signed in: {user.email}")
+    return AuthResponse(
+        access_token=token,
+        user={"id": user.id, "email": user.email, "full_name": user.full_name},
+    )
+
+
+@app.get("/auth/me")
+async def auth_me(current_user: User = Depends(get_current_user)):
+    """Return the currently authenticated user's info."""
+    return {"id": current_user.id, "email": current_user.email, "full_name": current_user.full_name}
+
+
 # ── Chat streaming endpoint ───────────────────────────────────────────────────
 
 @app.options("/chat/stream")
@@ -246,6 +310,7 @@ async def chat_stream(
     chat_request:     ChatRequest,
     background_tasks: BackgroundTasks,
     db:               AsyncSession = Depends(get_db),
+    current_user:     User         = Depends(get_current_user),
 ):
     """
     Streaming chat endpoint.
@@ -261,7 +326,7 @@ async def chat_stream(
         start_time = time.time()
         thread_id  = chat_request.thread_id or str(uuid.uuid4())
         is_new     = chat_request.thread_id is None
-        user_id    = chat_request.user_id
+        user_id    = current_user.id
 
         try:
             logger.info("=" * 80)
@@ -433,8 +498,9 @@ async def chat_stream(
 # ── Thread management endpoints ───────────────────────────────────────────────
 
 @app.get("/threads", response_model=List[ThreadSummary])
-async def list_threads(user_id: int, db: AsyncSession = Depends(get_db)):
+async def list_threads(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
     """List all threads for a user, most-recently-updated first."""
+    user_id = current_user.id
     # Count messages per thread
     msg_count_sq = (
         select(Message.thread_id, func.count(Message.id).label("cnt"))
@@ -464,8 +530,8 @@ async def list_threads(user_id: int, db: AsyncSession = Depends(get_db)):
 @app.get("/threads/{thread_id}", response_model=List[MessageOut])
 async def get_thread(
     thread_id: str,
-    user_id:   int,
     db:        AsyncSession = Depends(get_db),
+    current_user: User      = Depends(get_current_user),
 ):
     """Return all messages for a thread (oldest first)."""
     try:
@@ -473,6 +539,7 @@ async def get_thread(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid thread_id format")
 
+    user_id = current_user.id
     # Verify ownership
     result = await db.execute(
         select(Thread).where(Thread.thread_id == thread_uuid, Thread.user_id == user_id)
@@ -499,8 +566,8 @@ async def get_thread(
 @app.delete("/threads/{thread_id}", status_code=status.HTTP_200_OK)
 async def delete_thread(
     thread_id: str,
-    user_id:   int,
     db:        AsyncSession = Depends(get_db),
+    current_user: User      = Depends(get_current_user),
 ):
     """Delete a thread and all its messages (CASCADE)."""
     try:
@@ -508,6 +575,7 @@ async def delete_thread(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid thread_id format")
 
+    user_id = current_user.id
     result = await db.execute(
         select(Thread).where(Thread.thread_id == thread_uuid, Thread.user_id == user_id)
     )

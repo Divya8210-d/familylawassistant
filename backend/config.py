@@ -70,6 +70,10 @@ class Settings(BaseSettings):
     # ── Rate Limiting ─────────────────────────────────────────────────────────
     rate_limit_per_minute: int = Field(default=60, env="RATE_LIMIT_PER_MINUTE")
 
+    # ── Auth / JWT ────────────────────────────────────────────────────────────
+    jwt_secret_key: str = Field(..., env="JWT_SECRET_KEY")
+    jwt_algorithm: str  = Field(default="HS256", env="JWT_ALGORITHM")
+
     # ── Logging ───────────────────────────────────────────────────────────────
     log_level: str = Field(default="INFO", env="LOG_LEVEL")
 

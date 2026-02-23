@@ -1,6 +1,7 @@
 'use client';
 import React, { useState, useRef, useEffect } from 'react';
-import { Send, Trash2, Plus, Scale, BookOpen, Loader2, MessageSquare, ExternalLink, FileText, AlertCircle, CheckCircle, Clock, Info, Brain, Lightbulb, ChevronDown, ChevronUp } from 'lucide-react';
+import { useRouter } from 'next/navigation';
+import { Send, Trash2, Plus, Scale, BookOpen, Loader2, MessageSquare, ExternalLink, FileText, AlertCircle, CheckCircle, Clock, Info, Brain, Lightbulb, ChevronDown, ChevronUp, LogOut } from 'lucide-react';
 
 // ─── Colour Tokens ───────────────────────────────────────────────────────────
 // bg-page    : #ede8de   (warm parchment)
@@ -15,9 +16,6 @@ import { Send, Trash2, Plus, Scale, BookOpen, Loader2, MessageSquare, ExternalLi
 // border     : rgba(116,96,62,0.20)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ─── Auth stub ────────────────────────────────────────────────────────────────
-// Replace with your real auth logic. For now, we just use a fixed user ID to associate threads and messages.
-const MOCK_USER_ID = 1;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -68,26 +66,42 @@ interface MessageOut {
 }
 
 const LegalAssistChat: React.FC = () => {
-  const [threads, setThreads]                 = useState<ThreadSummary[]>([]);
+  const router = useRouter();
+  const [authToken, setAuthToken] = useState<string | null>(null);
+  const [authUser, setAuthUser] = useState<{ id: number; email: string; full_name: string } | null>(null);
+  const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [currentThreadId, setCurrentThreadId] = useState<string | null>(null);
-  const [messages, setMessages]               = useState<Message[]>([]);
-  const [input, setInput]                     = useState('');
-  const [isLoading, setIsLoading]             = useState(false);
-  const [sources, setSources]                 = useState<any[]>([]);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [input, setInput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [sources, setSources] = useState<any[]>([]);
   const [streamingMessage, setStreamingMessage] = useState('');
-  const [error, setError]                     = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [conversationStatus, setConversationStatus] = useState<string>('ready');
-  const [infoCollected, setInfoCollected]     = useState<Record<string, string>>({});
-  const [infoNeeded, setInfoNeeded]           = useState<string[]>([]);
+  const [infoCollected, setInfoCollected] = useState<Record<string, string>>({});
+  const [infoNeeded, setInfoNeeded] = useState<string[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const textareaRef    = useRef<HTMLTextAreaElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000';
 
   const scrollToBottom = () => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
 
   useEffect(() => { scrollToBottom(); }, [messages, streamingMessage]);
-  useEffect(() => { loadThreads(); }, []);
+  useEffect(() => {
+    // Auth check on mount
+    const token = localStorage.getItem('auth_token');
+    const userStr = localStorage.getItem('auth_user');
+    if (!token || !userStr) {
+      router.push('/auth');
+      return;
+    }
+    setAuthToken(token);
+    try { setAuthUser(JSON.parse(userStr)); } catch { router.push('/auth'); return; }
+  }, []);
+  useEffect(() => {
+    if (authToken) loadThreads();
+  }, [authToken]);
   useEffect(() => {
     if (textareaRef.current) {
       textareaRef.current.style.height = '48px';
@@ -97,9 +111,20 @@ const LegalAssistChat: React.FC = () => {
 
   // ── API calls ───────────────────────────────────────────────────────────────
 
+  const authHeaders = (): Record<string, string> => ({
+    'Authorization': `Bearer ${authToken}`,
+  });
+
+  const signOut = () => {
+    localStorage.removeItem('auth_token');
+    localStorage.removeItem('auth_user');
+    router.push('/auth');
+  };
+
   const loadThreads = async () => {
     try {
-      const res = await fetch(`${API_BASE}/threads?user_id=${MOCK_USER_ID}`);
+      const res = await fetch(`${API_BASE}/threads`, { headers: authHeaders() });
+      if (res.status === 401) { signOut(); return; }
       if (res.ok)
         setThreads(await res.json());
     } catch (err) {
@@ -125,7 +150,8 @@ const LegalAssistChat: React.FC = () => {
     try {
       setError(null);
       setStreamingMessage('');
-      const res = await fetch(`${API_BASE}/threads/${threadId}?user_id=${MOCK_USER_ID}`);
+      const res = await fetch(`${API_BASE}/threads/${threadId}`, { headers: authHeaders() });
+      if (res.status === 401) { signOut(); return; }
       if (!res.ok) throw new Error('Failed to load thread');
       const data: MessageOut[] = await res.json();
 
@@ -134,16 +160,16 @@ const LegalAssistChat: React.FC = () => {
       const formatted: Message[] = data.map((m, idx) => {
         const isLastAI = m.role === 'assistant' && idx === data.length - 1;
         const msg: Message = {
-          role:      m.role === 'user' ? 'user' : 'assistant',
-          content:   m.content,
+          role: m.role === 'user' ? 'user' : 'assistant',
+          content: m.content,
           timestamp: new Date(m.created_at),
         };
         // Restore reasoning + explainability from stored metadata
         if (isLastAI && m.metadata) {
           const meta = m.metadata;
-          if (meta.reasoning_steps?.length)        msg.reasoningSteps        = meta.reasoning_steps;
+          if (meta.reasoning_steps?.length) msg.reasoningSteps = meta.reasoning_steps;
           if (meta.precedent_explanations?.length) msg.precedentExplanations = meta.precedent_explanations;
-          if (meta.message_type)                   msg.messageType           = meta.message_type;
+          if (meta.message_type) msg.messageType = meta.message_type;
         } else if (m.role === 'assistant' && m.metadata?.message_type) {
           msg.messageType = m.metadata.message_type;
           if (m.metadata.message_type === 'information_gathering') {
@@ -173,7 +199,8 @@ const LegalAssistChat: React.FC = () => {
     e.stopPropagation();
     if (!window.confirm('Delete this conversation?')) return;
     try {
-      const res = await fetch(`${API_BASE}/threads/${threadId}?user_id=${MOCK_USER_ID}`, { method: 'DELETE' });
+      const res = await fetch(`${API_BASE}/threads/${threadId}`, { method: 'DELETE', headers: authHeaders() });
+      if (res.status === 401) { signOut(); return; }
       if (!res.ok) throw new Error('Delete failed');
       loadThreads();
       if (currentThreadId === threadId) createNewThread();
@@ -196,24 +223,24 @@ const LegalAssistChat: React.FC = () => {
     try {
       const res = await fetch(`${API_BASE}/chat/stream`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({
-          query:              text,
-          thread_id:          optimisticThreadId,   // null → backend generates UUID
-          user_id:            MOCK_USER_ID,
-          include_reasoning:  true,
+          query: text,
+          thread_id: optimisticThreadId,   // null → backend generates UUID
+          include_reasoning: true,
           include_prediction: true,
         }),
       });
+      if (res.status === 401) { signOut(); return; }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
       const reader = res.body?.getReader();
       if (!reader) throw new Error('No response body');
 
-      const decoder            = new TextDecoder();
-      let accumulatedText      = '';
+      const decoder = new TextDecoder();
+      let accumulatedText = '';
       let messageType: string | null = null;
-      let reasoningSteps: ReasoningStep[]        = [];
+      let reasoningSteps: ReasoningStep[] = [];
       let precedentExplanations: PrecedentExplanation[] = [];
 
       while (true) {
@@ -258,23 +285,23 @@ const LegalAssistChat: React.FC = () => {
               messageType = data.message_type || 'final_response';
               if (accumulatedText) {
                 const msg: Message = {
-                  role:                  'assistant',
-                  content:               accumulatedText,
-                  timestamp:             new Date(),
-                  messageType:           messageType as any,
-                  reasoningSteps:        data.reasoning_steps || reasoningSteps,
+                  role: 'assistant',
+                  content: accumulatedText,
+                  timestamp: new Date(),
+                  messageType: messageType as any,
+                  reasoningSteps: data.reasoning_steps || reasoningSteps,
                   precedentExplanations: data.precedent_explanations || precedentExplanations,
                 };
                 if (messageType === 'information_gathering') {
                   msg.infoCollected = data.info_collected;
-                  msg.infoNeeded    = data.info_needed;
+                  msg.infoNeeded = data.info_needed;
                 }
                 setMessages(prev => [...prev, msg]);
               }
               setStreamingMessage('');
               setConversationStatus(
                 messageType === 'final_response' ? 'completed' :
-                messageType === 'information_gathering' ? 'gathering_info' : 'clarifying'
+                  messageType === 'information_gathering' ? 'gathering_info' : 'clarifying'
               );
               // Ensure thread_id is set from done payload
               if (data.thread_id && !currentThreadId) setCurrentThreadId(data.thread_id);
@@ -321,27 +348,27 @@ const LegalAssistChat: React.FC = () => {
     new Date(iso).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
 
   const getStatusColor = (s: string) => ({
-    analyzing:     'bg-amber-100 text-amber-800 border-amber-300',
-    gathering_info:'bg-yellow-100 text-yellow-800 border-yellow-300',
-    completed:     'bg-green-100 text-green-800 border-green-300',
-    clarifying:    'bg-orange-100 text-orange-800 border-orange-300',
-    generating:    'bg-[#f0ebe1] text-[#74603e] border-[#c8b89a]',
+    analyzing: 'bg-amber-100 text-amber-800 border-amber-300',
+    gathering_info: 'bg-yellow-100 text-yellow-800 border-yellow-300',
+    completed: 'bg-green-100 text-green-800 border-green-300',
+    clarifying: 'bg-orange-100 text-orange-800 border-orange-300',
+    generating: 'bg-[#f0ebe1] text-[#74603e] border-[#c8b89a]',
   } as Record<string, string>)[s] || 'bg-stone-100 text-stone-600 border-stone-300';
 
   const getStatusIcon = (s: string) => ({
-    analyzing:      <Loader2 className="w-4 h-4 animate-spin" />,
+    analyzing: <Loader2 className="w-4 h-4 animate-spin" />,
     gathering_info: <Info className="w-4 h-4" />,
-    completed:      <CheckCircle className="w-4 h-4" />,
-    clarifying:     <AlertCircle className="w-4 h-4" />,
-    generating:     <Loader2 className="w-4 h-4 animate-spin" />,
+    completed: <CheckCircle className="w-4 h-4" />,
+    clarifying: <AlertCircle className="w-4 h-4" />,
+    generating: <Loader2 className="w-4 h-4 animate-spin" />,
   } as Record<string, React.ReactNode>)[s] || <Clock className="w-4 h-4" />;
 
   const getStatusText = (s: string) => ({
-    analyzing:      'Analyzing',
+    analyzing: 'Analyzing',
     gathering_info: 'Gathering Info',
-    completed:      'Completed',
-    clarifying:     'Clarifying',
-    generating:     'Generating',
+    completed: 'Completed',
+    clarifying: 'Clarifying',
+    generating: 'Generating',
   } as Record<string, string>)[s] || 'Ready';
 
   const getConfidenceColor = (c: number) => c >= 0.85 ? 'text-green-700' : c >= 0.70 ? 'text-yellow-700' : 'text-orange-700';
@@ -467,8 +494,8 @@ const LegalAssistChat: React.FC = () => {
   const renderInfoProgress = (msg: Message) => {
     if (msg.messageType !== 'information_gathering') return null;
     const collected = Object.keys(msg.infoCollected || {}).length;
-    const needed    = (msg.infoNeeded || []).length;
-    const total     = collected + needed;
+    const needed = (msg.infoNeeded || []).length;
+    const total = collected + needed;
     if (total === 0) return null;
     return (
       <div className="mt-3 p-3 bg-[#f7f3ec] rounded-lg border border-[#c8b89a]">
@@ -504,7 +531,7 @@ const LegalAssistChat: React.FC = () => {
         {/* ── Sidebar ────────────────────────────────────────────────────────── */}
         <div className="w-80 bg-[#e2dbd0]/90 border-r border-[#c8b89a] flex flex-col shadow-md backdrop-blur-sm">
           <div className="p-6 border-b border-[#c8b89a] bg-[#d8d0c4]">
-            <div className="flex items-center gap-3 mb-6">
+            <div className="flex items-center gap-3 mb-4">
               <div className="p-2 bg-[#74603e]/15 rounded-lg border border-[#c8b89a]">
                 <Scale className="w-6 h-6 text-[#74603e]" />
               </div>
@@ -513,6 +540,17 @@ const LegalAssistChat: React.FC = () => {
                 <p className="text-xs text-gray-600">Legal Assistant</p>
               </div>
             </div>
+            {authUser && (
+              <div className="flex items-center justify-between mb-4 p-2.5 bg-white/50 rounded-lg border border-[#c8b89a]/50">
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-[#2d1f0e] truncate">{authUser.full_name}</p>
+                  <p className="text-xs text-[#8a7462] truncate">{authUser.email}</p>
+                </div>
+                <button onClick={signOut} title="Sign out" className="p-1.5 text-[#8a7462] hover:text-red-600 transition-colors flex-shrink-0">
+                  <LogOut className="w-4 h-4" />
+                </button>
+              </div>
+            )}
             <button
               onClick={createNewThread}
               className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-amber-900 text-white rounded-lg font-medium transition-colors shadow-sm"
@@ -532,11 +570,10 @@ const LegalAssistChat: React.FC = () => {
                 <div
                   key={thread.thread_id}
                   onClick={() => loadThread(thread.thread_id)}
-                  className={`group p-3.5 rounded-lg cursor-pointer transition-all border ${
-                    currentThreadId === thread.thread_id
-                      ? 'bg-white border-[#74603e]/50 shadow-sm'
-                      : 'bg-transparent border-transparent hover:bg-white/60 hover:border-[#c8b89a]'
-                  }`}
+                  className={`group p-3.5 rounded-lg cursor-pointer transition-all border ${currentThreadId === thread.thread_id
+                    ? 'bg-white border-[#74603e]/50 shadow-sm'
+                    : 'bg-transparent border-transparent hover:bg-white/60 hover:border-[#c8b89a]'
+                    }`}
                 >
                   <div className="flex items-start justify-between">
                     <div className="flex-1 min-w-0">
@@ -614,24 +651,23 @@ const LegalAssistChat: React.FC = () => {
             )}
 
             {messages.map((msg, idx) => {
-              const isGathering    = msg.messageType === 'information_gathering';
-              const nextMsg        = messages[idx + 1];
-              const showInfoAfter  = isGathering && nextMsg?.messageType === 'final_response';
-              const infoToDisplay  = showInfoAfter ? (msg.infoCollected || infoCollected) : null;
+              const isGathering = msg.messageType === 'information_gathering';
+              const nextMsg = messages[idx + 1];
+              const showInfoAfter = isGathering && nextMsg?.messageType === 'final_response';
+              const infoToDisplay = showInfoAfter ? (msg.infoCollected || infoCollected) : null;
 
               return (
                 <React.Fragment key={idx}>
                   <div className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'} animate-fade-in`}>
                     <div className="max-w-4xl w-full">
-                      <div className={`rounded-2xl shadow-sm overflow-hidden border ${
-                        msg.role === 'user'
-                          ? 'ml-auto max-w-2xl bg-amber-900 border-amber-950 text-white'
-                          : msg.messageType === 'clarification'
-                            ? 'bg-amber-50 border-amber-200 text-[#2d1f0e]'
-                            : msg.messageType === 'information_gathering'
-                              ? 'bg-[#f7f3ec] border-[#c8b89a] text-[#2d1f0e]'
-                              : 'bg-white border-[rgba(116,96,62,0.20)] text-[#2d1f0e]'
-                      }`}>
+                      <div className={`rounded-2xl shadow-sm overflow-hidden border ${msg.role === 'user'
+                        ? 'ml-auto max-w-2xl bg-amber-900 border-amber-950 text-white'
+                        : msg.messageType === 'clarification'
+                          ? 'bg-amber-50 border-amber-200 text-[#2d1f0e]'
+                          : msg.messageType === 'information_gathering'
+                            ? 'bg-[#f7f3ec] border-[#c8b89a] text-[#2d1f0e]'
+                            : 'bg-white border-[rgba(116,96,62,0.20)] text-[#2d1f0e]'
+                        }`}>
                         <div className="px-5 py-4">
                           {msg.messageType === 'clarification' && (
                             <div className="flex items-center gap-2 mb-2 pb-2 border-b border-amber-200">
