@@ -1,87 +1,133 @@
 """
-Updated main.py with explainable AI support - streaming reasoning and precedent explanations.
+main.py - Family Law Legal Assistant API (production-ready).
+
+Key changes from the local-file version:
+  • Conversations persist in PostgreSQL (threads + messages tables).
+  • LangGraph state persists via AsyncPostgresSaver, keyed by thread_id.
+  • thread_id is a UUID generated in the backend on new conversations.
+  • Messages are saved via a FastAPI BackgroundTask (non-blocking).
+  • Auth stub: user_id passed in request body, FK → users table.
+  • Graph is initialised once in the lifespan via asynccontextmanager.
+  • Local history files and history_dir are gone.
 """
 
-# ===== LOGGING SETUP - MUST BE FIRST =====
+# ── Logging setup — must be first ─────────────────────────────────────────────
 import logging
 import sys
-from datetime import datetime
 from pathlib import Path
+from datetime import datetime
 
-# Create logs directory
 LOG_DIR = Path("./logs")
 LOG_DIR.mkdir(exist_ok=True)
-
-# Create daily log file
 log_filename = LOG_DIR / f"app_{datetime.now().strftime('%Y%m%d')}.log"
 
-# Configure root logger
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
-        logging.FileHandler(log_filename, encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
+        logging.FileHandler(log_filename, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
     ],
-    force=True
+    force=True,
 )
-
-# Reduce noise from third-party libraries
-logging.getLogger('httpx').setLevel(logging.WARNING)
-logging.getLogger('httpcore').setLevel(logging.WARNING)
-logging.getLogger('urllib3').setLevel(logging.WARNING)
-logging.getLogger('pymilvus').setLevel(logging.WARNING)
-logging.getLogger('sentence_transformers').setLevel(logging.WARNING)
+for noisy in ("httpx", "httpcore", "urllib3", "pymilvus", "sentence_transformers"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
-logger.info("="*80)
-logger.info("FAMILY LAW ASSISTANT API STARTING WITH EXPLAINABLE AI")
-logger.info(f"Logging to: {log_filename}")
-logger.info("="*80)
+logger.info("=" * 80)
+logger.info("FAMILY LAW ASSISTANT API STARTING")
+logger.info(f"Log file: {log_filename}")
+logger.info("=" * 80)
 
-# ===== NOW IMPORT OTHER MODULES =====
-from fastapi import FastAPI, HTTPException, Request, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
-from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, Field, validator
-from typing import List, Optional
+# ── Imports ───────────────────────────────────────────────────────────────────
 import json
 import os
-from graph import family_law_app
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from config import get_settings
+import time
 import traceback
+import uuid
+from contextlib import asynccontextmanager
+from typing import List, Optional
+
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import select, func, delete
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from langchain_core.messages import HumanMessage, AIMessage
+
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
+from config import get_settings
+from database import AsyncSessionLocal, Thread, Message, create_tables, get_db
+from graph import create_graph
+
+# ── Settings ──────────────────────────────────────────────────────────────────
+settings = get_settings()
+
+# ── Event trace directory (keep from original) ────────────────────────────────
 TRACE_DIR = "event_traces"
 os.makedirs(TRACE_DIR, exist_ok=True)
 
 
+# ── Lifespan ──────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Startup:
+      1. Create application-level tables (threads, messages).
+      2. Initialise the AsyncPostgresSaver and create its tables
+         (checkpoints, checkpoint_writes).
+      3. Compile the LangGraph app with the checkpointer.
 
-# Initialize settings
-settings = get_settings()
+    Shutdown:
+      Close the checkpointer connection pool.
+    """
+    logger.info("🚀 Starting up …")
 
-# Initialize rate limiter
+    # 1. Application tables
+    await create_tables()
+    logger.info("✅ Application tables ready")
+
+    # 2. LangGraph checkpointer
+    # AsyncPostgresSaver needs the plain psycopg3 DSN (not asyncpg).
+    # Convert: postgresql+asyncpg://... → postgresql://...
+    pg_dsn = settings.database_url.replace("postgresql+asyncpg://", "postgresql://")
+
+    async with AsyncPostgresSaver.from_conn_string(pg_dsn) as checkpointer:
+        await checkpointer.setup()
+        logger.info("✅ LangGraph checkpointer tables ready")
+
+        # 3. Compile graph
+        app.state.family_law_app = await create_graph(checkpointer)
+        logger.info("✅ LangGraph app ready")
+
+        yield  # ← application runs here
+
+    logger.info("👋 Shutdown complete")
+
+
+# ── FastAPI app ───────────────────────────────────────────────────────────────
 limiter = Limiter(key_func=get_remote_address)
 
-# Initialize FastAPI app
 app = FastAPI(
     title="Family Law Legal Assistant API",
     description="AI-powered family law consultation with explainable reasoning",
-    version="2.2.0",
+    version="3.0.0",
     docs_url="/api/docs",
-    redoc_url="/api/redoc"
+    redoc_url="/api/redoc",
+    lifespan=lifespan,
 )
 
-# Add rate limiter to app
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# CORS configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -91,745 +137,420 @@ app.add_middleware(
 )
 
 logger.info(f"CORS origins: {settings.cors_origins}")
-logger.info(f"History directory: {settings.history_dir}")
-
-# Request/Response Models
-class QueryRequest(BaseModel):
-    query: str = Field(..., min_length=1, max_length=2000)
-    conversation_id: Optional[str] = Field(None, max_length=100)
-    include_reasoning: bool = Field(default=True)
-    include_prediction: bool = Field(default=True)
-    
-    @validator('query')
-    def validate_query(cls, v):
-        if not v.strip():
-            raise ValueError("Query cannot be empty")
-        return v.strip()
-
-class ChatResponse(BaseModel):
-    response: str
-    sources: List[dict] = []
-    conversation_id: str
-    message_type: Optional[str] = None
-    info_collected: Optional[dict] = None
-    info_needed: Optional[List[str]] = None
-    reasoning_steps: Optional[List[dict]] = None
-    precedent_explanations: Optional[List[dict]] = None
-
-# Helper Functions
-def load_history(conversation_id: str) -> tuple:
-    """Load conversation history and state from local file."""
-    try:
-        history_file = os.path.join(settings.history_dir, f"{conversation_id}.json")
-        if os.path.exists(history_file):
-            with open(history_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                
-                messages = []
-                for msg in data.get("messages", []):
-                    role = msg["role"]
-                    content = msg["content"]
-                    
-                    if role == "HumanMessage":
-                        messages.append(HumanMessage(content=content))
-                    elif role == "AIMessage":
-                        messages.append(AIMessage(content=content))
-                    elif role == "SystemMessage":
-                        messages.append(SystemMessage(content=content))
-                
-                state = data.get("state", {})
-                logger.info(f"✓ Loaded {len(messages)} messages for {conversation_id}")
-                return messages, state
-    except Exception as e:
-        logger.error(f"❌ Error loading history for {conversation_id}: {str(e)}")
-    
-    return [], {}
-
-# def save_history(conversation_id: str, messages: List, state: dict) -> bool:
-#     """Save conversation history and state to local file."""
-#     try:
-#         history_file = os.path.join(settings.history_dir, f"{conversation_id}.json")
-        
-#         serializable_messages = []
-#         for msg in messages:
-#             if hasattr(msg, 'content'):
-#                 msg_dict = {
-#                     "role": msg.__class__.__name__,
-#                     "content": msg.content
-#                 }
-#                 serializable_messages.append(msg_dict)
-        
-#         # Save comprehensive state including reasoning
-#         data = {
-#             "messages": serializable_messages,
-#             "state": {
-#                 "user_intent": state.get("user_intent"),
-#                 "in_gathering_phase": state.get("in_gathering_phase", False),
-#                 "info_collected": state.get("info_collected", {}),
-#                 "info_needed_list": state.get("info_needed_list", []),
-#                 "gathering_step": state.get("gathering_step", 0),
-#                 "analysis_complete": state.get("analysis_complete", False),
-#                 "has_sufficient_info": state.get("has_sufficient_info", False),
-#                 "current_question_target": state.get("current_question_target"),
-#                 "message_type": state.get("message_type"),
-#                 "last_response": state.get("response", ""),
-#                 "reasoning_steps": state.get("reasoning_steps", []),
-#                 "precedent_explanations": state.get("precedent_explanations", []),
-#                 "follow_up_question": state.get("follow_up_question", None)
-#             },
-#             "last_updated": datetime.now().isoformat()
-#         }
-        
-#         with open(history_file, "w", encoding="utf-8") as f:
-#             json.dump(data, f, indent=2, ensure_ascii=False)
-        
-#         logger.info(f"✓ Saved {len(serializable_messages)} messages for {conversation_id}")
-#         return True
-#     except Exception as e:
-#         logger.error(f"❌ Error saving history for {conversation_id}: {str(e)}")
-#         return False
 
 
-# API Endpoints
-@app.get("/", response_model=dict)
-async def root():
-    """Root endpoint with API information."""
-    logger.info("Root endpoint accessed")
-    return {
-        "name": "Family Law Legal Assistant API",
-        "version": "2.2.0",
-        "status": "operational",
-        "features": [
-            "Iterative information gathering",
-            "Intent clarification",
-            "Multi-turn conversations",
-            "Streaming responses",
-            "Explainable AI reasoning",
-            "Precedent similarity analysis",
-            "Transparent information tracking"
-        ]
-    }
+# ── Request / Response models ─────────────────────────────────────────────────
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint for monitoring."""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "version": "2.2.0"
-    }
+class ChatRequest(BaseModel):
+    query:             str           = Field(..., min_length=1, max_length=2000)
+    thread_id:         Optional[str] = Field(None, description="UUID; omit to start a new conversation")
+    user_id:           int           = Field(..., description="FK → users.user_id")
+    include_reasoning: bool          = Field(default=True)
+    include_prediction: bool         = Field(default=True)
+
+    @field_validator("query")
+    @classmethod
+    def strip_query(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("query cannot be empty")
+        return v
+
+
+class ThreadSummary(BaseModel):
+    thread_id:     str
+    title:         Optional[str]
+    status:        str
+    message_count: int
+    updated_at:    str
+
+
+class MessageOut(BaseModel):
+    role:       str
+    content:    str
+    metadata:   Optional[dict]
+    created_at: str
+
+
+# ── Background task — save messages to DB ─────────────────────────────────────
+
+async def _save_interaction(
+    thread_id:   str,
+    user_id:     int,
+    user_query:  str,
+    ai_response: str,
+    ai_metadata: dict,
+    final_state: dict,
+):
+    """
+    Persist user + AI messages and update thread status.
+    Runs as a BackgroundTask so it never blocks the streaming response.
+    """
+    async with AsyncSessionLocal() as db:
+        try:
+            thread_uuid = uuid.UUID(thread_id)
+
+            # Determine new status from final graph state
+            if final_state.get("has_sufficient_info"):
+                new_status = "completed"
+            elif final_state.get("in_gathering_phase"):
+                new_status = "gathering_info"
+            else:
+                new_status = "analyzing"
+
+            # Update thread title (use first query truncated) + status
+            result = await db.execute(select(Thread).where(Thread.thread_id == thread_uuid))
+            thread = result.scalar_one_or_none()
+            if thread:
+                if not thread.title:
+                    thread.title = user_query[:120]
+                thread.status     = new_status
+                thread.updated_at = datetime.utcnow()
+
+            # Save user message
+            db.add(Message(
+                thread_id=thread_uuid,
+                user_id=user_id,
+                role="user",
+                content=user_query,
+            ))
+
+            # Save AI message with full metadata
+            db.add(Message(
+                thread_id=thread_uuid,
+                user_id=user_id,
+                role="assistant",
+                content=ai_response,
+                metadata_json=ai_metadata,
+            ))
+
+            await db.commit()
+            logger.info(f"✅ [bg] Saved interaction for thread {thread_id}")
+
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"❌ [bg] Failed to save interaction: {e}", exc_info=True)
+
+
+# ── Chat streaming endpoint ───────────────────────────────────────────────────
 
 @app.options("/chat/stream")
 async def chat_stream_options():
     return {}
 
-# @app.post("/chat/stream")
-# @limiter.limit(f"{settings.rate_limit_per_minute}/minute")
-# async def chat_stream(request: Request, query_request: QueryRequest):
-#     """Streaming chat endpoint with reasoning and explanations."""
-    
-#     async def event_generator():
-#         conversation_id = None
-#         try:
-#             conversation_id = query_request.conversation_id or f"conv_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-#             logger.info("="*80)
-#             logger.info(f"NEW REQUEST: {conversation_id}")
-#             logger.info(f"Query: {query_request.query}")
-#             logger.info(f"Include Reasoning: {query_request.include_reasoning}")
-#             logger.info("="*80)
-            
-#             # Load history and previous state
-#             messages, previous_state = load_history(conversation_id)
-#             logger.info(f"Loaded {len(messages)} previous messages")
-            
-#             # Add current user message
-#             user_message = HumanMessage(content=query_request.query)
-#             messages.append(user_message)
-#             logger.info(f"Total messages now: {len(messages)}")
-            
-#             # Prepare state
-#             state = {
-#                 "query": query_request.query,
-#                 "messages": messages,
-#                 "conversation_id": conversation_id,
-                
-#                 # Restore previous state
-#                 "root_query": previous_state.get("root_query", ""),
-#                 "user_intent": previous_state.get("user_intent", ""),
-#                 "analysis_complete": previous_state.get("analysis_complete", False),
-#                 "needs_clarification": False,
-#                 "clarification_question": None,
-                
-#                 # Information gathering state
-#                 "in_gathering_phase": previous_state.get("in_gathering_phase", False),
-#                 "has_sufficient_info": previous_state.get("has_sufficient_info", False),
-#                 "info_collected": previous_state.get("info_collected", {}),
-#                 "info_needed_list": previous_state.get("info_needed_list", []),
-#                 "needs_more_info": False,
-#                 "follow_up_question": previous_state.get("follow_up_question", None),
-#                 "gathering_step": previous_state.get("gathering_step", 0),
-#                 "current_question_target": previous_state.get("current_question_target"),
-#                 "response": previous_state.get("last_response", ""),
-                
-#                 # Explainability features
-#                 "include_reasoning": query_request.include_reasoning,
-#                 "include_prediction": query_request.include_prediction,
-#                 "reasoning_steps": [],
-#                 "precedent_explanations": [],
-                
-#                 # Retrieval and generation
-#                 "retrieved_chunks": [],
-#                 "sources": [],
-#                 "message_type": None
-#             }
-            
-#             logger.info(f"State: in_gathering={state['in_gathering_phase']}, "
-#                        f"step={state['gathering_step']}, "
-#                        f"collected={len(state['info_collected'])}, "
-#                        f"needed={len(state['info_needed_list'])}")
-            
-#             yield f"data: {json.dumps({'type': 'metadata', 'conversation_id': conversation_id})}\n\n"
-            
-#             # Track response
-#             accumulated_response = ""
-#             sources = []
-#             message_type = None
-#             reasoning_steps = []
-#             precedent_explanations = []
-#             final_state = {}
-            
-#             # Stream events from graph
-#             async for event in family_law_app.astream_events(state, version="v2"):
-#                 kind = event["event"]
-                
-#                 # Clarification
-#                 if kind == "on_chain_end" and event.get("name") == "clarify":
-#                     output = event.get("data", {}).get("output", {})
-#                     message_type = "clarification"
-#                     response_text = output.get("response", "")
-                    
-#                     logger.info(f"→ Clarification: {response_text[:100]}...")
-#                     yield f"data: {json.dumps({'type': 'clarification', 'content': response_text})}\n\n"
-#                     accumulated_response = response_text
-                
-#                 # Information gathering question
-#                 if kind == "on_chain_end" and event.get("name") == "ask_question":
-#                     output = event.get("data", {}).get("output", {})
-#                     message_type = "information_gathering"
-#                     response_text = output.get("response", "")
-#                     info_collected = output.get("info_collected", {})
-#                     info_needed = output.get("info_needed", [])
-                    
-#                     logger.info(f"→ Gathering question - collected: {len(info_collected)}, needed: {len(info_needed)}")
-                    
-#                     gathering_data = {
-#                         'type': 'information_gathering',
-#                         'content': response_text,
-#                         'info_collected': info_collected,
-#                         'info_needed': info_needed
-#                     }
-#                     yield f"data: {json.dumps(gathering_data)}\n\n"
-#                     accumulated_response = response_text
-                
-#                 # Retrieval
-#                 if kind == "on_chain_end" and event.get("name") == "retrieve":
-#                     output = event.get("data", {}).get("output", {})
-#                     sources = output.get("sources", [])
-#                     logger.info(f"→ Retrieved {len(sources)} sources")
-#                     yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
-                
-#                 # LLM streaming
-#                 if kind == "on_chat_model_stream":
-#                     content = event["data"]["chunk"].content
-#                     if content:
-#                         message_type = "final_response"
-#                         accumulated_response += content
-#                         yield f"data: {json.dumps({'type': 'token', 'content': content})}\n\n"
-                
-#                 # Completion
-#                 if kind == "on_chain_end" and event.get("name") == "LangGraph":
-#                     output = event.get("data", {}).get("output", {})
-#                     final_state = output
-                    
-#                     # Extract reasoning and explanations
-#                     reasoning_steps = output.get("reasoning_steps", [])
-#                     precedent_explanations = output.get("precedent_explanations", [])
-                    
-#                     if reasoning_steps:
-#                         logger.info(f"→ Generated {len(reasoning_steps)} reasoning steps")
-#                         yield f"data: {json.dumps({'type': 'reasoning', 'steps': reasoning_steps})}\n\n"
-                    
-#                     if precedent_explanations:
-#                         logger.info(f"→ Generated {len(precedent_explanations)} precedent explanations")
-#                         yield f"data: {json.dumps({'type': 'precedent_explanations', 'explanations': precedent_explanations})}\n\n"
-            
-#             # CRITICAL: Save AI message to history
-#             if accumulated_response:
-#                 ai_message = AIMessage(content=accumulated_response)
-#                 messages.append(ai_message)
-#                 logger.info(f"✓ Added AI message ({len(accumulated_response)} chars), total messages: {len(messages)}")
-            
-#             # Save updated state and messages
-#             save_history(conversation_id, messages, final_state)
-            
-#             # Send completion
-#             completion_data = {
-#                 'type': 'done',
-#                 'message_type': message_type or 'final_response',
-#                 'response': accumulated_response
-#             }
-            
-#             if message_type == "information_gathering":
-#                 completion_data['info_collected'] = final_state.get("info_collected", {})
-#                 completion_data['info_needed'] = final_state.get("info_needed_list", [])
-            
-#             if reasoning_steps:
-#                 completion_data['reasoning_steps'] = reasoning_steps
-            
-#             if precedent_explanations:
-#                 completion_data['precedent_explanations'] = precedent_explanations
-            
-#             yield f"data: {json.dumps(completion_data)}\n\n"
-            
-#             logger.info(f"✓ Request completed for {conversation_id}")
-#             logger.info("="*80)
-            
-#         except Exception as e:
-#             logger.error(f"❌ Error in streaming: {str(e)}")
-#             logger.error(traceback.format_exc())
-#             error_data = {'type': 'error', 'message': 'An error occurred.'}
-#             yield f"data: {json.dumps(error_data)}\n\n"
-    
-#     return StreamingResponse(
-#         event_generator(),
-#         media_type="text/event-stream",
-#         headers={
-#             "Cache-Control": "no-cache",
-#             "Connection": "keep-alive",
-#             "X-Accel-Buffering": "no"
-#         }
-#     )
-
-# @app.get("/history/{conversation_id}")
-# async def get_history(conversation_id: str):
-#     """Get conversation history with state."""
-#     try:
-#         logger.info(f"Loading history for: {conversation_id}")
-#         history_file = os.path.join(settings.history_dir, f"{conversation_id}.json")
-        
-#         if not os.path.exists(history_file):
-#             raise HTTPException(
-#                 status_code=status.HTTP_404_NOT_FOUND,
-#                 detail="Conversation not found"
-#             )
-        
-#         with open(history_file, "r", encoding="utf-8") as f:
-#             data = json.load(f)
-        
-#         logger.info(f"✓ Retrieved history for {conversation_id}")
-#         return data
-    
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         logger.error(f"Error retrieving history: {str(e)}")
-#         raise HTTPException(
-#             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-#             detail="Failed to retrieve conversation history"
-#         )
-
-
-
-"""
-Fixed main.py - Properly saves reasoning and precedent explanations to history.
-
-Key fixes:
-1. Saves reasoning_steps and precedent_explanations to conversation history
-2. Loads them back when retrieving history
-3. Frontend can display them on refresh
-"""
-
-# ... (keep all your existing imports and setup code) ...
-
-def save_history(conversation_id: str, messages: List, state: dict) -> bool:
-    """Save conversation history with reasoning and explanations."""
-    try:
-        history_file = os.path.join(settings.history_dir, f"{conversation_id}.json")
-        
-        serializable_messages = []
-        for msg in messages:
-            if hasattr(msg, 'content'):
-                msg_dict = {
-                    "role": msg.__class__.__name__,
-                    "content": msg.content
-                }
-                serializable_messages.append(msg_dict)
-        
-        # CRITICAL: Save reasoning and precedent explanations
-        data = {
-            "messages": serializable_messages,
-            "state": {
-                "root_query": state.get("root_query", ""),
-                "user_gender": state.get("user_gender", "unknown"),
-                "user_intent": state.get("user_intent"),
-                "in_gathering_phase": state.get("in_gathering_phase", False),
-                "info_collected": state.get("info_collected", {}),
-                "info_needed_list": state.get("info_needed_list", []),
-                "gathering_step": state.get("gathering_step", 0),
-                "analysis_complete": state.get("analysis_complete", False),
-                "has_sufficient_info": state.get("has_sufficient_info", False),
-                "current_question_target": state.get("current_question_target"),
-                "message_type": state.get("message_type"),
-                "last_response": state.get("response", ""),
-                
-                # *** SAVE REASONING AND EXPLANATIONS ***
-                "reasoning_steps": state.get("reasoning_steps", []),
-                "precedent_explanations": state.get("precedent_explanations", []),
-                
-                "follow_up_question": state.get("follow_up_question", None)
-            },
-            "last_updated": datetime.now().isoformat()
-        }
-        
-        with open(history_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        
-        logger.info(f"✓ Saved history with {len(state.get('reasoning_steps', []))} reasoning steps")
-        return True
-    except Exception as e:
-        logger.error(f"❌ Error saving history: {e}")
-        return False
-
-
-
 
 @app.post("/chat/stream")
 @limiter.limit(f"{settings.rate_limit_per_minute}/minute")
-async def chat_stream(request: Request, query_request: QueryRequest):
-    """Streaming chat endpoint with proper state management."""
-    
+async def chat_stream(
+    request:          Request,
+    chat_request:     ChatRequest,
+    background_tasks: BackgroundTasks,
+    db:               AsyncSession = Depends(get_db),
+):
+    """
+    Streaming chat endpoint.
+
+    Flow:
+      1. If thread_id is absent → generate UUID, create Thread row, emit 'setup' SSE.
+      2. Load LangGraph state from Postgres checkpointer (automatic via thread_id config).
+      3. Stream graph events.
+      4. After stream completes, fire a BackgroundTask to save messages.
+    """
+
     async def event_generator():
-        conversation_id = None
+        start_time = time.time()
+        thread_id  = chat_request.thread_id or str(uuid.uuid4())
+        is_new     = chat_request.thread_id is None
+        user_id    = chat_request.user_id
+
         try:
-            conversation_id = query_request.conversation_id or f"conv_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            logger.info("="*80)
-            logger.info(f"NEW REQUEST: {conversation_id}")
-            logger.info(f"Query: {query_request.query}")
-            logger.info("="*80)
+            logger.info("=" * 80)
+            logger.info(f"REQUEST  thread={thread_id}  user={user_id}  new={is_new}")
+            logger.info(f"Query: {chat_request.query}")
+            logger.info("=" * 80)
 
-            trace_file_path = os.path.join(
-                TRACE_DIR,
-                f"{conversation_id}.log"
-            )
+            # ── 1. Create Thread row if new ───────────────────────────────────
+            if is_new:
+                db.add(Thread(
+                    thread_id=uuid.UUID(thread_id),
+                    user_id=user_id,
+                    title=chat_request.query[:120],
+                    status="analyzing",
+                ))
+                await db.commit()
+                yield f"data: {json.dumps({'type': 'setup', 'thread_id': thread_id})}\n\n"
+                logger.info(f"✅ Created new thread {thread_id}")
 
-            trace_file = open(trace_file_path, "a", encoding="utf-8")
+            # ── 2. Prepare initial graph state ────────────────────────────────
+            # LangGraph's checkpointer restores the full state automatically when
+            # we pass config={"configurable": {"thread_id": thread_id}}.
+            # We only need to pass the new turn's inputs.
+            graph_config = {"configurable": {"thread_id": thread_id}}
 
-            def write_trace(event_type, payload):
-                trace_file.write(
-                    json.dumps(
-                        {
-                            "ts": datetime.utcnow().isoformat(),
-                            "type": event_type,
-                            "payload": payload
-                        },
-                        default=str
-                    ) + "\n"
-                )
-                trace_file.flush()   # IMPORTANT: don’t lose data on crash
-
-            
-            # Load history
-            messages, previous_state = load_history(conversation_id)
-            logger.info(f"Loaded {len(messages)} previous messages")
-            
-            # Add current user message
-            user_message = HumanMessage(content=query_request.query)
-            messages.append(user_message)
-            
-            # Prepare state with persistence for gender
-            state = {
-                "query": query_request.query,
-                "messages": messages,
-                "conversation_id": conversation_id,
-                
-                # Restore previous state
-                "user_gender": previous_state.get("user_gender", "unknown"),
-                "root_query": previous_state.get("root_query", ""),
-                "user_intent": previous_state.get("user_intent", ""),
-                "analysis_complete": previous_state.get("analysis_complete", False),
-                
-                # *** PERSIST INFO_COLLECTED (including gender) ***
-                "info_collected": previous_state.get("info_collected", {}),
-                "info_needed_list": previous_state.get("info_needed_list", []),
-                
-                "in_gathering_phase": previous_state.get("in_gathering_phase", False),
-                "has_sufficient_info": previous_state.get("has_sufficient_info", False),
-                "needs_more_info": False,
-                "follow_up_question": previous_state.get("follow_up_question", None),
-                "gathering_step": previous_state.get("gathering_step", 0),
-                "current_question_target": previous_state.get("current_question_target"),
-                "response": previous_state.get("last_response", ""),
-                
-                # Explainability features
-                "include_reasoning": query_request.include_reasoning,
-                "include_prediction": query_request.include_prediction,
-                "reasoning_steps": [],
+            initial_state = {
+                "query":              chat_request.query,
+                "messages":           [HumanMessage(content=chat_request.query)],
+                "include_reasoning":  chat_request.include_reasoning,
+                "include_prediction": chat_request.include_prediction,
+                # Resettable per-turn fields
+                "needs_more_info":    False,
+                "reasoning_steps":    [],
                 "precedent_explanations": [],
-                
-                # Retrieval and generation
-                "retrieved_chunks": [],
-                "sources": [],
-                "message_type": None
+                "retrieved_chunks":   [],
+                "sources":            [],
+                "message_type":       None,
             }
-            
-            logger.info(f"State: in_gathering={state['in_gathering_phase']}, "
-                       f"collected={list(state['info_collected'].keys())}")
-            
-            yield f"data: {json.dumps({'type': 'metadata', 'conversation_id': conversation_id})}\n\n"
-            
-            # Track response
-            accumulated_response = ""
-            sources = []
-            message_type = None
-            reasoning_steps = []
+
+            yield f"data: {json.dumps({'type': 'metadata', 'thread_id': thread_id})}\n\n"
+
+            # ── 3. Open event trace file ──────────────────────────────────────
+            trace_path = os.path.join(TRACE_DIR, f"{thread_id}.log")
+            trace_file = open(trace_path, "a", encoding="utf-8")
+
+            def write_trace(event_type: str, payload):
+                trace_file.write(
+                    json.dumps({"ts": datetime.utcnow().isoformat(), "type": event_type, "payload": payload}, default=str) + "\n"
+                )
+                trace_file.flush()
+
+            # ── 4. Stream graph events ────────────────────────────────────────
+            accumulated_response   = ""
+            sources                = []
+            message_type           = None
+            reasoning_steps        = []
             precedent_explanations = []
-            final_state = {}
-            
-            # Stream events
-            async for event in family_law_app.astream_events(state, version="v2"):
+            final_state            = {}
+
+            family_law_app = request.app.state.family_law_app
+
+            async for event in family_law_app.astream_events(
+                initial_state, config=graph_config, version="v2"
+            ):
                 write_trace("langgraph_event", event)
                 kind = event["event"]
-                
+
                 # Clarification
                 if kind == "on_chain_end" and event.get("name") == "clarify":
-                    output = event.get("data", {}).get("output", {})
+                    output       = event.get("data", {}).get("output", {})
                     message_type = "clarification"
                     response_text = output.get("response", "")
-                    
-                    logger.info(f"→ Clarification: {response_text[:100]}...")
-                    yield f"data: {json.dumps({'type': 'clarification', 'content': response_text})}\n\n"
                     accumulated_response = response_text
-                
-                # Information gathering
-                if kind == "on_chain_end" and event.get("name") == "ask_question":
-                    output = event.get("data", {}).get("output", {})
-                    message_type = "information_gathering"
+                    yield f"data: {json.dumps({'type': 'clarification', 'content': response_text})}\n\n"
+
+                # Information gathering question
+                elif kind == "on_chain_end" and event.get("name") == "ask_question":
+                    output        = event.get("data", {}).get("output", {})
+                    message_type  = "information_gathering"
                     response_text = output.get("response", "")
                     info_collected = output.get("info_collected", {})
-                    info_needed = output.get("info_needed", [])
-                    
-                    logger.info(f"→ Gathering - collected: {list(info_collected.keys())}")
-                    
-                    gathering_data = {
-                        'type': 'information_gathering',
-                        'content': response_text,
-                        'info_collected': info_collected,
-                        'info_needed': info_needed
-                    }
-                    yield f"data: {json.dumps(gathering_data)}\n\n"
+                    info_needed    = output.get("info_needed", [])
                     accumulated_response = response_text
-                
-                # Retrieval
-                if kind == "on_chain_end" and event.get("name") == "retrieve":
-                    output = event.get("data", {}).get("output", {})
-                    sources = output.get("sources", [])
-                    logger.info(f"→ Retrieved {len(sources)} sources")
-                    yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
-                
-                # LLM streaming
+                    yield f"data: {json.dumps({'type': 'information_gathering', 'content': response_text, 'info_collected': info_collected, 'info_needed': info_needed})}\n\n"
 
-                if kind == "on_chat_model_stream" and (event["metadata"]["langgraph_node"] == "gather_info" or event["metadata"]["langgraph_node"] == "generate"):
+                # Retrieval sources
+                elif kind == "on_chain_end" and event.get("name") == "retrieve":
+                    output  = event.get("data", {}).get("output", {})
+                    sources = output.get("sources", [])
+                    yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
+
+                # LLM token streaming (only from generate + gather_info nodes)
+                elif kind == "on_chat_model_stream" and event.get("metadata", {}).get("langgraph_node") in ("generate", "gather_info"):
                     content = event["data"]["chunk"].content
-                    
                     if content:
                         message_type = "final_response"
                         accumulated_response += content
                         yield f"data: {json.dumps({'type': 'token', 'content': content})}\n\n"
-                
-                # Completion
-                if kind == "on_chain_end" and event.get("name") == "LangGraph":
-                    output = event.get("data", {}).get("output", {})
-                    final_state = output
-                    
-                    # Extract reasoning and explanations
-                    reasoning_steps = output.get("reasoning_steps", [])
+
+                # Graph completed
+                elif kind == "on_chain_end" and event.get("name") == "LangGraph":
+                    output                 = event.get("data", {}).get("output", {})
+                    final_state            = output
+                    reasoning_steps        = output.get("reasoning_steps", [])
                     precedent_explanations = output.get("precedent_explanations", [])
-                    
+
                     if reasoning_steps:
-                        logger.info(f"→ {len(reasoning_steps)} reasoning steps")
                         yield f"data: {json.dumps({'type': 'reasoning', 'steps': reasoning_steps})}\n\n"
-                    
                     if precedent_explanations:
-                        logger.info(f"→ {len(precedent_explanations)} precedent explanations")
                         yield f"data: {json.dumps({'type': 'precedent_explanations', 'explanations': precedent_explanations})}\n\n"
-            
-            # Save AI message
-            if accumulated_response:
-                ai_message = AIMessage(content=accumulated_response)
-                messages.append(ai_message)
-                logger.info(f"✓ Added AI message, total: {len(messages)}")
-            
-            # *** SAVE COMPLETE STATE INCLUDING REASONING ***
-            save_history(conversation_id, messages, final_state)
-            
-            # Send completion
-            completion_data = {
-                'type': 'done',
-                'message_type': message_type or 'final_response',
-                'response': accumulated_response
+
+            trace_file.close()
+
+            # ── 5. Schedule background save ───────────────────────────────────
+            latency_ms   = int((time.time() - start_time) * 1000)
+            ai_metadata  = {
+                "latency_ms":              latency_ms,
+                "message_type":            message_type or "final_response",
+                "reasoning_steps":         reasoning_steps,
+                "precedent_explanations":  precedent_explanations,
+                "sources":                 sources,
             }
-            
+
+            background_tasks.add_task(
+                _save_interaction,
+                thread_id,
+                user_id,
+                chat_request.query,
+                accumulated_response,
+                ai_metadata,
+                final_state,
+            )
+
+            # ── 6. Send done event ────────────────────────────────────────────
+            completion: dict = {
+                "type":         "done",
+                "message_type": message_type or "final_response",
+                "response":     accumulated_response,
+                "thread_id":    thread_id,
+            }
             if message_type == "information_gathering":
-                completion_data['info_collected'] = final_state.get("info_collected", {})
-                completion_data['info_needed'] = final_state.get("info_needed_list", [])
-            
-            # Include reasoning and precedents in completion
+                completion["info_collected"] = final_state.get("info_collected", {})
+                completion["info_needed"]    = final_state.get("info_needed_list", [])
             if reasoning_steps:
-                completion_data['reasoning_steps'] = reasoning_steps
-            
+                completion["reasoning_steps"] = reasoning_steps
             if precedent_explanations:
-                completion_data['precedent_explanations'] = precedent_explanations
-            
-            yield f"data: {json.dumps(completion_data)}\n\n"
-            
-            logger.info(f"✓ Request completed")
-            logger.info("="*80)
-            
+                completion["precedent_explanations"] = precedent_explanations
+
+            yield f"data: {json.dumps(completion)}\n\n"
+            logger.info(f"✅ Request done — thread={thread_id}  latency={latency_ms}ms")
+            logger.info("=" * 80)
+
         except Exception as e:
-            logger.error(f"❌ Error: {e}")
+            logger.error(f"❌ Streaming error: {e}")
             logger.error(traceback.format_exc())
-            error_data = {'type': 'error', 'message': 'An error occurred.'}
-            yield f"data: {json.dumps(error_data)}\n\n"
-    
+            yield f"data: {json.dumps({'type': 'error', 'message': 'An error occurred.'})}\n\n"
+
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        }
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
-@app.get("/history/{conversation_id}")
-async def get_history(conversation_id: str):
-    """Get conversation history with reasoning and explanations."""
-    try:
-        logger.info(f"Loading history for: {conversation_id}")
-        history_file = os.path.join(settings.history_dir, f"{conversation_id}.json")
-        
-        if not os.path.exists(history_file):
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Conversation not found"
-            )
-        
-        with open(history_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        
-        # *** RETURN WITH REASONING AND EXPLANATIONS ***
-        logger.info(f"✓ Retrieved with {len(data.get('state', {}).get('reasoning_steps', []))} reasoning steps")
-        return data
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error retrieving history: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve conversation history"
+# ── Thread management endpoints ───────────────────────────────────────────────
+
+@app.get("/threads", response_model=List[ThreadSummary])
+async def list_threads(user_id: int, db: AsyncSession = Depends(get_db)):
+    """List all threads for a user, most-recently-updated first."""
+    # Count messages per thread
+    msg_count_sq = (
+        select(Message.thread_id, func.count(Message.id).label("cnt"))
+        .group_by(Message.thread_id)
+        .subquery()
+    )
+    result = await db.execute(
+        select(Thread, msg_count_sq.c.cnt)
+        .outerjoin(msg_count_sq, Thread.thread_id == msg_count_sq.c.thread_id)
+        .where(Thread.user_id == user_id)
+        .order_by(Thread.updated_at.desc())
+    )
+    rows = result.all()
+
+    return [
+        ThreadSummary(
+            thread_id=str(row.Thread.thread_id),
+            title=row.Thread.title,
+            status=row.Thread.status,
+            message_count=row.cnt or 0,
+            updated_at=row.Thread.updated_at.isoformat(),
         )
+        for row in rows
+    ]
 
 
-@app.delete("/history/{conversation_id}")
-async def delete_history(conversation_id: str):
-    """Delete conversation history."""
+@app.get("/threads/{thread_id}", response_model=List[MessageOut])
+async def get_thread(
+    thread_id: str,
+    user_id:   int,
+    db:        AsyncSession = Depends(get_db),
+):
+    """Return all messages for a thread (oldest first)."""
     try:
-        logger.info(f"Deleting history for: {conversation_id}")
-        history_file = os.path.join(settings.history_dir, f"{conversation_id}.json")
-        
-        if not os.path.exists(history_file):
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Conversation not found"
-            )
-        
-        os.remove(history_file)
-        logger.info(f"✓ Deleted {conversation_id}")
-        return {"message": "Conversation history deleted successfully"}
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error deleting history: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to delete conversation history"
-        )
+        thread_uuid = uuid.UUID(thread_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid thread_id format")
 
-@app.get("/conversations")
-async def list_conversations():
-    """List all conversations with metadata."""
+    # Verify ownership
+    result = await db.execute(
+        select(Thread).where(Thread.thread_id == thread_uuid, Thread.user_id == user_id)
+    )
+    if not result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    msgs = await db.execute(
+        select(Message)
+        .where(Message.thread_id == thread_uuid)
+        .order_by(Message.created_at.asc())
+    )
+    return [
+        MessageOut(
+            role=m.role,
+            content=m.content,
+            metadata=m.metadata_json,
+            created_at=m.created_at.isoformat(),
+        )
+        for m in msgs.scalars().all()
+    ]
+
+
+@app.delete("/threads/{thread_id}", status_code=status.HTTP_200_OK)
+async def delete_thread(
+    thread_id: str,
+    user_id:   int,
+    db:        AsyncSession = Depends(get_db),
+):
+    """Delete a thread and all its messages (CASCADE)."""
     try:
-        logger.info("Listing all conversations")
-        conversations = []
-        
-        if not os.path.exists(settings.history_dir):
-            return {"conversations": []}
-        
-        for filename in os.listdir(settings.history_dir):
-            if filename.endswith(".json"):
-                conv_id = filename.replace(".json", "")
-                filepath = os.path.join(settings.history_dir, filename)
-                modified_time = datetime.fromtimestamp(os.path.getmtime(filepath))
-                
-                try:
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                        message_count = len(data.get("messages", []))
-                        state = data.get("state", {})
-                        
-                        if state.get("has_sufficient_info"):
-                            status = "completed"
-                        elif state.get("in_gathering_phase"):
-                            status = "gathering_info"
-                        else:
-                            status = "analyzing"
-                        
-                        conversations.append({
-                            "conversation_id": conv_id,
-                            "last_modified": modified_time.isoformat(),
-                            "message_count": message_count,
-                            "status": status,
-                            "user_intent": state.get("user_intent", "Unknown"),
-                            "has_reasoning": len(state.get("reasoning_steps", [])) > 0
-                        })
-                except:
-                    continue
-        
-        logger.info(f"✓ Found {len(conversations)} conversations")
-        return {
-            "conversations": sorted(
-                conversations,
-                key=lambda x: x["last_modified"],
-                reverse=True
-            )
-        }
-    
-    except Exception as e:
-        logger.error(f"Error listing conversations: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve conversations"
-        )
+        thread_uuid = uuid.UUID(thread_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid thread_id format")
 
+    result = await db.execute(
+        select(Thread).where(Thread.thread_id == thread_uuid, Thread.user_id == user_id)
+    )
+    thread = result.scalar_one_or_none()
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    await db.execute(delete(Message).where(Message.thread_id == thread_uuid))
+    await db.delete(thread)
+    await db.commit()
+
+    logger.info(f"🗑️  Deleted thread {thread_id}")
+    return {"status": "success", "thread_id": thread_id}
+
+
+# ── Health / root ─────────────────────────────────────────────────────────────
+
+@app.get("/")
+async def root():
+    return {
+        "name":    "Family Law Legal Assistant API",
+        "version": "3.0.0",
+        "status":  "operational",
+        "storage": "PostgreSQL + LangGraph AsyncPostgresSaver",
+    }
+
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status":    "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "version":   "3.0.0",
+    }
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    logger.info(f"Starting server on {settings.api_host}:{settings.api_port}")
     uvicorn.run(
-        app,
+        "main:app",
         host=settings.api_host,
         port=settings.api_port,
-        log_level=settings.log_level.lower()
+        log_level=settings.log_level.lower(),
+        reload=False,
     )
