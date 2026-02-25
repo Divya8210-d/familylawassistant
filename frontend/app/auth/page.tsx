@@ -11,6 +11,7 @@ export default function AuthPage() {
     const [email, setEmail] = useState('');
     const [password, setPassword] = useState('');
     const [fullName, setFullName] = useState('');
+    const [gender, setGender] = useState('');
     const [error, setError] = useState<string | null>(null);
     const [loading, setLoading] = useState(false);
     const [showPassword, setShowPassword] = useState(false);
@@ -23,7 +24,10 @@ export default function AuthPage() {
         try {
             const endpoint = mode === 'signup' ? '/auth/signup' : '/auth/signin';
             const body: Record<string, string> = { email, password };
-            if (mode === 'signup') body.full_name = fullName;
+            if (mode === 'signup') {
+                body.full_name = fullName;
+                if (gender) body.gender = gender;
+            }
 
             const res = await fetch(`${API_BASE}${endpoint}`, {
                 method: 'POST',
@@ -120,6 +124,22 @@ export default function AuthPage() {
                                         className="w-full pl-10 pr-4 py-2.5 bg-[#f7f3ec] border border-[#c8b89a] rounded-xl text-[#2d1f0e] placeholder-[#8a7462] focus:outline-none focus:ring-2 focus:ring-[#74603e]/40 focus:border-[#74603e] transition-colors text-sm"
                                     />
                                 </div>
+                            </div>
+                        )}
+
+                        {mode === 'signup' && (
+                            <div>
+                                <label className="block text-sm font-medium text-[#4a3728] mb-1.5">Gender</label>
+                                <select
+                                    value={gender}
+                                    onChange={e => setGender(e.target.value)}
+                                    className="w-full px-4 py-2.5 bg-[#f7f3ec] border border-[#c8b89a] rounded-xl text-[#2d1f0e] focus:outline-none focus:ring-2 focus:ring-[#74603e]/40 focus:border-[#74603e] transition-colors text-sm"
+                                >
+                                    <option value="">Select gender</option>
+                                    <option value="male">Male</option>
+                                    <option value="female">Female</option>
+                                    <option value="other">Other</option>
+                                </select>
                             </div>
                         )}
 
