@@ -26,6 +26,7 @@ class InformationGatherer:
     QUESTION_GENERATION_PROMPT = """You are a compassionate Indian FAMILY LAW attorney conducting a client consultation.
 
 SITUATION:
+- Client's Name: {name}
 - Client's Query: {root_query}
 - Client's Intent: {user_intent}
 - Client's Gender: {gender}
@@ -112,6 +113,10 @@ Q: "Have you been living separately?"
 Response: "Since last year due to constant fights"
 → "The parties have been living separately since last year due to ongoing conflicts."
 
+Q: "What's your income?"
+Response: "10 thousand"
+→ "The client's monthly income is 10 thousand rupees."(rupees because it's an Indian family law context)
+
 Response (JSON only, no other text):
 {{
   "extracted_answer": "the comprehensive generated answer based on user response OR NOT_PROVIDED"
@@ -145,6 +150,9 @@ Response (JSON only, no other text):
         user_intent = state.get("user_intent", "legal advice")
         gathering_step = state.get("gathering_step", 0)
         gender = state.get("user_gender", "unknown")
+        name = state.get("name", "the client")
+
+        logger.info(f"\nUser name:{name}, Gender:{gender}, Intent: {user_intent}\n")
         
         logger.info(f"=== Gathering Step {gathering_step} ===")
         logger.info(f"Info needed: {info_needed_list}")
@@ -156,16 +164,17 @@ Response (JSON only, no other text):
             
             # Get user's response
             user_messages = [m for m in messages if m.__class__.__name__ == "HumanMessage"]
-            
+            # print(user_messages)
             if len(user_messages) > gathering_step:
-                last_user_msg = user_messages[gathering_step]
+                last_user_msg = user_messages[-1]
+                print(last_user_msg)
                 last_question = state.get("follow_up_question", "")
                 
                 logger.info(f"Extracting answer for: {current_target}")
                 logger.info(f"Question was: {last_question}")
                 logger.info(f"User response: {last_user_msg.content[:100]}...")
                 
-                # Extract the information
+                # Extract the information  
                 extracted = self._extract_information(
                     last_question=last_question,
                     user_response=last_user_msg.content,
@@ -226,6 +235,7 @@ Response (JSON only, no other text):
         logger.info(f"Generating question for: {next_target}")
         
         next_question = self._generate_question(
+            name=name,
             gender=gender,
             root_query=root_query,
             user_intent=user_intent,
@@ -265,6 +275,7 @@ Response (JSON only, no other text):
     
     def _generate_question(
         self,
+        name: str,
         gender: str,
         root_query: str,
         user_intent: str,
@@ -277,6 +288,7 @@ Response (JSON only, no other text):
         collected_str = self._format_info_collected(info_collected)
         
         prompt = self.QUESTION_GENERATION_PROMPT.format(
+            name=name,
             gender=gender,
             root_query=root_query,
             user_intent=user_intent.replace("_", " ").title(),

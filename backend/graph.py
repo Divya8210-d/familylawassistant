@@ -49,10 +49,16 @@ def analyze_query_node(state: FamilyLawState) -> FamilyLawState:
         agent = QueryAnalyzer()
         response = agent.analyze_query(state)
 
+        intent_confidence = response.get("intent_confidence", "low")
+
+        if intent_confidence == "low" or not response.get("user_intent"):
+            state["needs_clarification"]   = True
+            state["clarification_question"] = "Could you please provide more details about your legal situation?"
+            return state
+
         state["user_intent"]      = response.get("user_intent")
         state["info_needed_list"] = response.get("info_needed_list", [])
         state["has_sufficient_info"] = response.get("has_sufficient_info", False)
-        state["user_gender"]      = response.get("user_gender", state.get("user_gender"))
 
         new_info = response.get("info_collected", {})
         if is_update:
@@ -69,20 +75,16 @@ def analyze_query_node(state: FamilyLawState) -> FamilyLawState:
         logger.info(f"   Info needed: {state['info_needed_list']}")
         logger.info(f"   Sufficient: {state['has_sufficient_info']}")
 
-        intent_confidence = response.get("intent_confidence", "high")
-        if intent_confidence == "low" or not response.get("user_intent"):
-            state["needs_clarification"]   = True
-            state["clarification_question"] = "Could you please provide more details about your legal situation?"
+        state["needs_clarification"] = False
+        if not is_update and state["user_intent"]:
+            state["root_query"] = state["query"]
+        if not state["info_needed_list"]:
+            state["has_sufficient_info"] = True
+            state["in_gathering_phase"]  = False
         else:
-            state["needs_clarification"] = False
-            if not is_update and state["user_intent"]:
-                state["root_query"] = state["query"]
-            if not state["info_needed_list"]:
-                state["has_sufficient_info"] = True
-                state["in_gathering_phase"]  = False
-            else:
-                state["in_gathering_phase"] = True
-                state["gathering_step"]     = 0
+            state["in_gathering_phase"] = True
+            state["gathering_step"]     = 0
+        
 
         state["is_update"] = False
         return state
@@ -136,7 +138,7 @@ def revalidate_information_node(state: FamilyLawState) -> FamilyLawState:
     try:
         info_collected = state.get("info_collected", {})
 
-        if state.get("revalidation_count", 0) >= 2 or len(info_collected) >= 10:
+        if state.get("revalidation_count", 0) >= 2 or len(info_collected) >= 7:
             logger.warning("⚠️  Maximum re-validation attempts reached")
             state.update({
                 "has_sufficient_info": True,

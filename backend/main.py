@@ -12,6 +12,7 @@ Key changes from the local-file version:
 """
 
 # ── Logging setup — must be first ─────────────────────────────────────────────
+from hmac import new
 import logging
 import sys
 from pathlib import Path
@@ -220,8 +221,13 @@ async def _save_interaction(
             result = await db.execute(select(Thread).where(Thread.thread_id == thread_uuid))
             thread = result.scalar_one_or_none()
             if thread:
-                if not thread.title:
-                    thread.title = user_query[:120]
+                if new_status == "gathering_info":
+                    intent = final_state.get("user_intent")
+                    
+                    if intent:
+                        thread.title = intent[:120]
+                    else:
+                        thread.title = user_query[:120]
                 thread.status     = new_status
                 thread.updated_at = datetime.utcnow()
 

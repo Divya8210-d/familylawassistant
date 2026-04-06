@@ -22,6 +22,7 @@ class FamilyLawState(MessagesState):
     name:Optional[str]
     query: str
     user_gender: Optional[str]
+    name: Optional[str]
 
     # ── Analysis phase ────────────────────────────────────────────────────────
     root_query:            Optional[str]
