@@ -24,7 +24,7 @@ def generate_embeddings(file_path):
     print(f"\n📊 Processing {len(chunks)} chunks from {category_name}")
     
     # Extract content for batch processing
-    contents = [chunk["content"] for chunk in chunks]
+    contents = [f"query{chunk['metadata']['query-text']}+ans{chunk['content']}" for chunk in chunks]
     
     # Generate embeddings in batches
     print("Generating embeddings...")

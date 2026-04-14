@@ -19,6 +19,7 @@ class FamilyLawState(MessagesState):
     """
 
     # ── Current query ─────────────────────────────────────────────────────────
+    name:Optional[str]
     query: str
     user_gender: Optional[str]
     name: Optional[str]

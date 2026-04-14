@@ -373,7 +373,7 @@ async def chat_stream(
                 "retrieved_chunks":   [],
                 "sources":            [],
                 "message_type":       None,
-                "name":               current_user.full_name or "the client",
+                "name": current_user.full_name or "the client",
             }
 
             yield f"data: {json.dumps({'type': 'metadata', 'thread_id': thread_id})}\n\n"
