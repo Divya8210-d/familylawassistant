@@ -68,7 +68,7 @@ interface MessageOut {
 const LegalAssistChat: React.FC = () => {
   const router = useRouter();
   const [authToken, setAuthToken] = useState<string | null>(null);
-  const [authUser, setAuthUser] = useState<{ id: number; email: string; full_name: string } | null>(null);
+  const [authUser, setAuthUser] = useState<{ id: number; email: string; full_name: string; gender?: string } | null>(null);
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [currentThreadId, setCurrentThreadId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -89,15 +89,39 @@ const LegalAssistChat: React.FC = () => {
 
   useEffect(() => { scrollToBottom(); }, [messages, streamingMessage]);
   useEffect(() => {
-    // Auth check on mount
-    const token = localStorage.getItem('auth_token');
-    const userStr = localStorage.getItem('auth_user');
+    // Auth check on mount — check both localStorage and sessionStorage
+    const token = localStorage.getItem('auth_token') || sessionStorage.getItem('auth_token');
+    const userStr = localStorage.getItem('auth_user') || sessionStorage.getItem('auth_user');
     if (!token || !userStr) {
       router.push('/auth');
       return;
     }
     setAuthToken(token);
     try { setAuthUser(JSON.parse(userStr)); } catch { router.push('/auth'); return; }
+
+    // Validate token against backend /auth/me endpoint
+    fetch(`${API_BASE}/auth/me`, {
+      headers: { 'Authorization': `Bearer ${token}` },
+    }).then(res => {
+      if (res.status === 401) {
+        // Token expired or invalid — clear and redirect
+        localStorage.removeItem('auth_token');
+        localStorage.removeItem('auth_user');
+        sessionStorage.removeItem('auth_token');
+        sessionStorage.removeItem('auth_user');
+        router.push('/auth');
+      } else if (res.ok) {
+        // Update user data from backend (in case it changed)
+        res.json().then(user => {
+          setAuthUser(user);
+          const storage = localStorage.getItem('auth_token') ? localStorage : sessionStorage;
+          storage.setItem('auth_user', JSON.stringify(user));
+        });
+      }
+    }).catch(() => {
+      // Network error — allow offline usage with cached data
+      console.warn('Could not validate token — backend may be offline');
+    });
   }, []);
   useEffect(() => {
     if (authToken) loadThreads();
@@ -118,6 +142,8 @@ const LegalAssistChat: React.FC = () => {
   const signOut = () => {
     localStorage.removeItem('auth_token');
     localStorage.removeItem('auth_user');
+    sessionStorage.removeItem('auth_token');
+    sessionStorage.removeItem('auth_user');
     router.push('/auth');
   };
 
@@ -251,6 +277,7 @@ const LegalAssistChat: React.FC = () => {
           if (!line.startsWith('data: ')) continue;
           try {
             const data = JSON.parse(line.slice(6));
+            console.log("========== BACKEND RESPONSE ==========", data);
 
             if (data.type === 'setup') {
               // Backend assigned a new thread_id
