@@ -1,0 +1,65 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Environment secrets (NEVER bake into image)
+.env
+.env.local
+.env.production
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# Docker
+docker-compose.yml
+docker-compose.override.yml
+Dockerfile
+.dockerignore
+
+# Runtime data (generated at runtime, not needed in build)
+logs/
+event_traces/
+volumes/
+data/chat_history/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Tests
+test/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Docs & images (not needed at runtime)
+README.md
+image.png
+
+# UV cache
+.uv/
+
+# Raw data files (only needed for one-time embedding pipeline, not at runtime)
+data/family_law_domain/
+
+# One-time pipeline scripts (not needed at runtime)
+chunking.py
+embedding.py
+milvus_store.py
+app.py
+
+# Backup files
+*.bak
+*.log
