@@ -1,14 +1,19 @@
+[tool.uv]
+index-url = "https://download.pytorch.org/whl/cpu"
+
 [project]
 name = "family-law-assistant"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
+
 dependencies = [
     # Core Framework
     "fastapi>=0.109.0",
     "uvicorn[standard]>=0.38.0",
     "python-multipart>=0.0.6",
+
     # LangChain & LangGraph
     "langchain>=0.1.4",
     "langsmith>=0.0.77",
@@ -18,33 +23,41 @@ dependencies = [
     "langchain-mistralai>=1.0.1",
     "langchain-text-splitters>=1.0.0",
     "langgraph>=1.0.2",
+
     # Vector Store
     "pymilvus>=2.6.3",
+
+    # 🔥 IMPORTANT: CPU-only PyTorch (prevents huge CUDA downloads)
+    "torch==2.2.2+cpu",
+
     # Embeddings & LLM
     "transformers>=4.36.2",
-    "torch>=2.1.2",
+    "sentence-transformers>=4.1.0",
     "requests>=2.31.0",
     "tiktoken>=0.12.0",
-    "sentence-transformers>=4.1.0",
+
     # Data Processing
     "pydantic>=2.5.3",
     "pydantic-settings>=2.1.0",
     "tqdm>=4.66.1",
+
     # API and HTTP
     "httpx>=0.26.0",
-    "slowapi>=0.1.9", # Rate limiting
+    "slowapi>=0.1.9",
+
     # Utilities
     "python-dotenv>=1.0.0",
     "websockets>=12.0",
+
     # Monitoring & Logging
     "loguru>=0.7.2",
-    "accelerate>=1.12.0",
     "psutil>=7.2.0",
     "rich>=14.2.0",
     "sqlalchemy[asyncio]>=2.0.45",
     "asyncpg>=0.31.0",
     "psycopg[binary,pool]>=3.3.3",
     "langgraph-checkpoint-postgres>=3.0.4",
+
     # Auth
     "passlib[bcrypt]>=1.7.4",
     "python-jose[cryptography]>=3.3.0",

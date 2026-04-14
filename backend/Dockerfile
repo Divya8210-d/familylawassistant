@@ -1,9 +1,6 @@
 # ============================================
 # Family Law Assistant — Backend Dockerfile
 # ============================================
-# Multi-stage build: keeps final image lean
-# Python 3.11 (matches .python-version)
-# ============================================
 
 # ── Stage 1: Builder ─────────────────────────
 FROM python:3.11-slim AS builder
@@ -18,6 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install uv (fast Python package manager)
 RUN pip install --no-cache-dir uv
+
+# ✅ IMPORTANT: Force CPU-only PyTorch (prevents CUDA downloads)
+ENV UV_INDEX_URL=https://download.pytorch.org/whl/cpu
 
 # Copy dependency files first (Docker layer caching)
 COPY pyproject.toml uv.lock ./
@@ -38,28 +38,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy virtual environment from builder
 COPY --from=builder /app/.venv /app/.venv
 
-# Put venv on PATH so `python`, `uvicorn`, etc. resolve to venv binaries
+# Put venv on PATH
 ENV PATH="/app/.venv/bin:$PATH"
-# Prevent Python from buffering stdout/stderr (important for Docker logs)
+
+# Runtime env settings
 ENV PYTHONUNBUFFERED=1
-# Disable tokenizer parallelism warnings from HuggingFace
 ENV TOKENIZERS_PARALLELISM=false
 
 # Copy application source code
 COPY . .
 
-# Create directories the app expects at runtime
+# Create directories required by app
 RUN mkdir -p logs event_traces data/chunked data/embeddings
 
-# Expose the API port
+# Expose API port
 EXPOSE 8000
 
-# Health check — Render and other platforms use this
+# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Start the server
-# - Single worker: embedding model loads in-process (~90MB RAM), 
-#   multiple workers would duplicate it
-# - timeout 120: embedding model can take time to load on first start
+# Start FastAPI server
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--timeout-keep-alive", "120"]
